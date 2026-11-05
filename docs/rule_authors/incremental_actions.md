@@ -113,3 +113,38 @@ The user script would then:
 2. Parse action metadata file, compute what is needed to update the result, and
    amend it accordingly.
 3. Calculate the new state and write it into the new `incremental_state.json`.
+
+## Remote incremental state
+
+Set `incremental_remote_outputs = True` together with
+`no_outputs_cleanup = True` to make previous declared outputs available to a
+remote action. Every output of such an action, including depfiles, must use
+`has_content_based_path = False` when declared. Buck2 imports the previous
+outputs when all of their materializer entries are available; a missing entry
+causes a cold invocation. Deleting a physical file alone does not guarantee a
+cold invocation, because the materializer can restore it.
+
+Treat this state as an optimization, not an additional source of build
+semantics. Correct results must not depend on whether previous state is
+available. State can be absent, incompatible, or left by a failed invocation;
+there is no last-successful-state guarantee. The command must detect unusable
+state and rebuild safely, and must not expose stale ordinary outputs after
+failure. Declare compiler state separately from libraries and executables, and
+keep it out of downstream action inputs.
+
+Successful incremental results are published under the source-only action key
+used by fresh worktrees, even when execution used a different action digest
+containing previous state. This alias publication respects action-level and
+executor-level cache-upload permissions and the existing upload-size limit.
+Failed actions do not publish successful source-key aliases.
+
+Imported files may be read-only hardlinks shared with the remote input store.
+Before modifying them, atomically replace them with owned files; use copy-on-write
+copies where available. Do not chmod a shared inode to make it writable. On Unix,
+Buck2's own post-action permission normalization also detaches shared regular
+files before changing their mode, including after a command fails without
+touching its outputs.
+
+Incremental state has no separate per-action byte or entry quota. Compiler
+session cleanup and the configured artifact-cache limits still apply; measure
+state retention and physical storage for the workload being deployed.

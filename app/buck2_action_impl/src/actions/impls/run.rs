@@ -1325,6 +1325,7 @@ impl RunAction {
         let (result, req, action_and_blobs) = match result {
             ControlFlow::Break(res) => (res, req, prepared_action.action_and_blobs),
             ControlFlow::Continue(mut manager) => {
+                let mut source_action_and_blobs = None;
                 manager
                     .inner
                     .waiting_data
@@ -1345,6 +1346,9 @@ impl RunAction {
                             ctx.run_action_knobs().action_paths_interner.as_ref(),
                         )?;
                         let override_prepared_action = ctx.prepare_action(&override_req, true)?;
+                        // Prior outputs are advisory execution inputs, not part
+                        // of the source-only key used by the cache lookup.
+                        source_action_and_blobs = Some(prepared_action.action_and_blobs);
                         (override_req, override_prepared_action)
                     } else {
                         (req, prepared_action)
@@ -1353,7 +1357,11 @@ impl RunAction {
                     (req, prepared_action)
                 };
                 let execution_result = ctx.exec_cmd(manager, &req, &prepared_action).await;
-                (execution_result, req, prepared_action.action_and_blobs)
+                (
+                    execution_result,
+                    req,
+                    source_action_and_blobs.unwrap_or(prepared_action.action_and_blobs),
+                )
             }
         };
 

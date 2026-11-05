@@ -25,3 +25,24 @@ whistle(
     dir = True,
     invalidate = seed_val,
 )
+
+incremental_library(
+    name = "incremental_library",
+    local = read_config("test", "local", "false") == "true",
+    runner = "incremental_library.py",
+    seed = seed_val,
+    source = "library_source.json",
+    upload = read_config("test", "upload", "true") == "true",
+)
+
+incremental_consumer(
+    name = "incremental_consumer",
+    library = ":incremental_library",
+    runner = "incremental_library.py",
+    seed = seed_val,
+)
+
+incremental_execution(
+    name = "incremental_execution",
+    upload = read_config("test", "executor_upload", "true") == "true",
+)

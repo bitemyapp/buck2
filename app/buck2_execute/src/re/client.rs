@@ -122,6 +122,7 @@ use crate::re::uploader::Uploader;
 
 pub enum ActionCacheWriteType {
     LocalCacheUpload,
+    IncrementalSourceAlias,
     PermissionCheck,
     RemoteDepFile,
 }
@@ -129,6 +130,7 @@ impl ActionCacheWriteType {
     fn as_str(&self) -> &'static str {
         match *self {
             ActionCacheWriteType::LocalCacheUpload => "local_cache_upload",
+            ActionCacheWriteType::IncrementalSourceAlias => "incremental_source_alias",
             ActionCacheWriteType::PermissionCheck => "permission_check",
             ActionCacheWriteType::RemoteDepFile => "remote_dep_file",
         }

@@ -10,6 +10,8 @@
 
 use std::ops::Add as _;
 #[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -21,6 +23,8 @@ use buck2_common::file_ops::metadata::FileDigestConfig;
 use buck2_common::file_ops::metadata::FileMetadata;
 use buck2_common::file_ops::metadata::FileType;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
+#[cfg(unix)]
+use buck2_common::temp_path::TempPath;
 use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
@@ -90,7 +94,19 @@ fn do_normalize_permissions(path: &AbsNormPathBuf) -> buck2_error::Result<()> {
             };
         if mode != perms.mode() {
             perms.set_mode(mode);
-            fs_util::set_permissions(path, perms).categorize_input()?;
+            if m.is_file() && m.nlink() > 1 {
+                // Incremental outputs can still be read-only hardlinks to remote
+                // inputs, including when the action fails before touching them.
+                // Never chmod a shared inode. The copy preserves sparse files
+                // and shares extents where supported.
+                let copy =
+                    TempPath::new_in(path.parent().internal_error("output has no parent")?)?;
+                fs_util::copy(path, copy.path()).categorize_input()?;
+                fs_util::set_permissions(copy.path(), perms).categorize_input()?;
+                fs_util::rename(copy.path(), path).categorize_input()?;
+            } else {
+                fs_util::set_permissions(path, perms).categorize_input()?;
+            }
         }
     }
     #[cfg(not(unix))]
@@ -324,4 +340,31 @@ fn create_symlink(
         }
     }
     new_symlink(symlink_target)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizing_shared_output_preserves_donor() -> buck2_error::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let donor = dir.path().join("donor");
+        let output = AbsNormPathBuf::new(dir.path().join("output"))?;
+        std::fs::write(&donor, b"cached state")?;
+        std::fs::set_permissions(&donor, std::fs::Permissions::from_mode(0o444))?;
+        std::fs::hard_link(&donor, &output)?;
+        let donor_inode = std::fs::metadata(&donor)?.ino();
+
+        do_normalize_permissions(&output)?;
+
+        let donor_metadata = std::fs::metadata(&donor)?;
+        assert_eq!(donor_metadata.ino(), donor_inode);
+        assert_eq!(donor_metadata.permissions().mode() & 0o777, 0o444);
+        assert_eq!(std::fs::metadata(&output)?.permissions().mode() & 0o777, 0o644);
+        assert_ne!(std::fs::metadata(&output)?.ino(), donor_inode);
+        std::fs::write(&output, b"next session")?;
+        assert_eq!(std::fs::read(&donor)?, b"cached state");
+        Ok(())
+    }
 }
