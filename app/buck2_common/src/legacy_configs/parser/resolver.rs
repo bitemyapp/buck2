@@ -201,7 +201,7 @@ impl ConfigResolver {
 
             let config_key = captures.get(1).unwrap().as_str();
 
-            let config_section_and_key = parse_config_section_and_key(config_key, None)?;
+            let config_section_and_key = parse_config_section_and_key(config_key)?;
 
             resolved.push_str(self.resolve_item(
                 resolved_items,

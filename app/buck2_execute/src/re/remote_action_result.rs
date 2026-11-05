@@ -16,6 +16,8 @@ use buck2_error::BuckErrorContext;
 use buck2_miniperf_proto::MiniperfCounter;
 use remote_execution::ActionResultResponse;
 use remote_execution::ExecuteResponse;
+use remote_execution::TActionResult2;
+use remote_execution::TDigest;
 use remote_execution::TDirectory2;
 use remote_execution::TExecutedActionMetadata;
 use remote_execution::TFile;
@@ -37,6 +39,7 @@ pub trait RemoteActionResult: Send + Sync {
     fn output_files(&self) -> &[TFile];
     fn output_directories(&self) -> &[TDirectory2];
     fn output_symlinks(&self) -> &[TSymlink];
+    fn std_stream_digests(&self) -> [Option<&TDigest>; 2];
 
     fn execution_kind(&self, details: RemoteCommandExecutionDetails) -> CommandExecutionKind;
 
@@ -98,6 +101,10 @@ impl RemoteActionResult for ExecuteResponseWithQueueStats {
         &self.execute_response.action_result.output_symlinks
     }
 
+    fn std_stream_digests(&self) -> [Option<&TDigest>; 2] {
+        std_stream_digests(&self.execute_response.action_result)
+    }
+
     fn execution_kind(&self, details: RemoteCommandExecutionDetails) -> CommandExecutionKind {
         self.execution_kind_for_failed_actions(details, None, None)
     }
@@ -147,6 +154,10 @@ impl RemoteActionResult for ActionCacheResult {
         &self.0.action_result.output_symlinks
     }
 
+    fn std_stream_digests(&self) -> [Option<&TDigest>; 2] {
+        std_stream_digests(&self.0.action_result)
+    }
+
     fn execution_kind(&self, details: RemoteCommandExecutionDetails) -> CommandExecutionKind {
         match self.1 {
             buck2_data::CacheType::ActionCache => CommandExecutionKind::ActionCache { details },
@@ -183,6 +194,19 @@ impl RemoteActionResult for ActionCacheResult {
     fn ttl(&self) -> i64 {
         self.0.ttl
     }
+}
+
+fn std_stream_digests(result: &TActionResult2) -> [Option<&TDigest>; 2] {
+    [
+        result
+            .stdout_digest
+            .as_ref()
+            .filter(|_| result.stdout_raw.as_ref().is_none_or(Vec::is_empty)),
+        result
+            .stderr_digest
+            .as_ref()
+            .filter(|_| result.stderr_raw.as_ref().is_none_or(Vec::is_empty)),
+    ]
 }
 
 pub struct ReMetadataTiming {
@@ -265,4 +289,33 @@ fn convert_perf_count(
             .try_into()
             .buck_error_context("Invalid time_running")?,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stream_presence_matches_inline_byte_precedence() {
+        let digest = TDigest {
+            hash: "aa".to_owned(),
+            size_in_bytes: 1,
+            ..Default::default()
+        };
+        let mut result = TActionResult2 {
+            stdout_raw: Some(vec![b'x']),
+            stdout_digest: Some(digest.clone()),
+            stderr_raw: Some(Vec::new()),
+            stderr_digest: Some(digest),
+            ..Default::default()
+        };
+        let [stdout, stderr] = std_stream_digests(&result);
+        assert!(stdout.is_none());
+        assert_eq!(stderr, result.stderr_digest.as_ref());
+        result.stdout_raw = None;
+        result.stderr_digest = None;
+        let [stdout, stderr] = std_stream_digests(&result);
+        assert_eq!(stdout, result.stdout_digest.as_ref());
+        assert!(stderr.is_none());
+    }
 }

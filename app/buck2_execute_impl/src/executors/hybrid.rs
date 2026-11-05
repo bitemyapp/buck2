@@ -186,6 +186,7 @@ where
             manager.inner.liveliness_observer.dupe(),
             manager.inner.waiting_data.clone(),
         )
+        .with_remote_action_cache_rejected(manager.inner.remote_action_cache_rejected)
         .with_intend_to_fallback_on_failure(fallback_on_failure);
         let was_result_delayed = remote_manager.inner.was_result_delayed.dupe();
         let remote_result = self.remote_exec_cmd(command, remote_manager, cancellations);

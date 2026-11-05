@@ -263,8 +263,12 @@ fn compute_auto_bounds(
 
     let bound = derived.bound();
     let mut predicates: Vec<WherePredicate> = Vec::new();
-    for ident in &visitor.type_params_used {
-        predicates.push(parse_quote! { #ident: #bound });
+    // Preserve declaration order instead of randomized HashSet iteration.
+    for param in input.generics.type_params() {
+        let ident = &param.ident;
+        if visitor.type_params_used.contains(ident) {
+            predicates.push(parse_quote! { #ident: #bound });
+        }
     }
     for path in &visitor.associated_types_used {
         predicates.push(parse_quote! { #path: #bound });

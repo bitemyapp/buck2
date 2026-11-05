@@ -577,10 +577,11 @@ mod tests {
                         open_event_log_for_writing(log, None, EventLogType::System).await?,
                     ],
                 },
-                sanitized_argv: Argv {
-                    argv: vec!["buck2".to_owned()],
-                    expanded_argv: ExpandedArgv::from_literals(vec!["buck2".to_owned()]),
-                }
+                sanitized_argv: Argv::new(
+                    vec!["buck2".to_owned()],
+                    ExpandedArgv::from_literals(vec!["buck2".to_owned()]),
+                    Default::default(),
+                )
                 .no_need_to_sanitize(),
                 command_name: "testtest".to_owned(),
                 working_dir: AbsWorkingDir::current_dir()?,

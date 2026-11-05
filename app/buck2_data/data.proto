@@ -554,6 +554,8 @@ message BuckconfigComponent {
 message ConfigValue {
   string section = 1;
   string key = 2;
+  // Logging-only: ALL values must be replaced with <redacted> before native
+  // dispatch. Arbitrarily named keys can alias credentials; execution uses real configs.
   string value = 3;
   optional string cell = 4;
   // whether config is provided by the command line (either single arg or config

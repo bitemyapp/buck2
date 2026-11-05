@@ -125,16 +125,91 @@ fn tstatus_ok() -> TStatus {
     }
 }
 
+// The fields needed from google.rpc.PreconditionFailure. Descriptions are
+// deliberately not decoded: recovery is based only on the protocol's typed
+// violation and digest resource name, never a server's human-readable message.
+#[derive(Clone, PartialEq, Message)]
+struct PreconditionFailure {
+    #[prost(message, repeated, tag = "1")]
+    violations: Vec<PreconditionViolation>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PreconditionViolation {
+    #[prost(string, tag = "1")]
+    r#type: String,
+    #[prost(string, tag = "2")]
+    subject: String,
+}
+
+fn is_missing_blob_subject(subject: &str) -> bool {
+    let Some(resource) = subject.strip_prefix("blobs/") else {
+        return false;
+    };
+    let Some((hash, size)) = resource.rsplit_once('/') else {
+        return false;
+    };
+    let hash = match hash.split_once('/') {
+        Some((function, hash))
+            if !function.is_empty()
+                && function.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) =>
+        {
+            hash
+        }
+        Some(_) => return false,
+        None => hash,
+    };
+    !hash.is_empty()
+        && hash.bytes().all(|c| c.is_ascii_hexdigit())
+        && !size.is_empty()
+        && size.bytes().all(|c| c.is_ascii_digit())
+        && size.parse::<i64>().is_ok()
+}
+
+fn status_reason_group(status: &Status) -> TCodeReasonGroup {
+    if status.code != TCode::FAILED_PRECONDITION.0 {
+        return TCodeReasonGroup::UNKNOWN;
+    }
+    let mut missing = false;
+    for detail in &status.details {
+        if detail.type_url != "type.googleapis.com/google.rpc.PreconditionFailure" {
+            continue;
+        }
+        let Ok(failure) = PreconditionFailure::decode(detail.value.as_slice()) else {
+            return TCodeReasonGroup::UNKNOWN;
+        };
+        if failure.violations.is_empty()
+            || !failure
+                .violations
+                .iter()
+                .all(|v| v.r#type == "MISSING" && is_missing_blob_subject(&v.subject))
+        {
+            return TCodeReasonGroup::UNKNOWN;
+        }
+        missing = true;
+    }
+    if missing {
+        TCodeReasonGroup::DIGEST_NOT_FOUND
+    } else {
+        TCodeReasonGroup::UNKNOWN
+    }
+}
+
+fn error_from_status(status: Status) -> REClientError {
+    let group = status_reason_group(&status);
+    REClientError {
+        code: TCode(status.code),
+        message: status.message,
+        group,
+    }
+}
+
 fn check_status(status: Status) -> Result<(), REClientError> {
     if status.code == 0 {
         return Ok(());
     }
 
-    Err(REClientError {
-        code: TCode(status.code),
-        message: status.message,
-        group: TCodeReasonGroup::UNKNOWN,
-    })
+    Err(error_from_status(status))
 }
 
 fn ttimestamp_to(ts: &TTimestamp) -> ::prost_types::Timestamp {
@@ -416,15 +491,23 @@ impl InjectHeadersInterceptor {
                 let value = substitute_env_vars(&h.value)?;
 
                 let key = MetadataKey::<metadata::Ascii>::from_bytes(key.as_bytes())
-                    .with_context(|| format!("Invalid key in header: `{key}: {value}`"))?;
+                    .context("Invalid remote execution header key")?;
 
-                let value = MetadataValue::try_from(&value)
-                    .with_context(|| format!("Invalid value in header: `{key}: {value}`"))?;
+                let mut value = MetadataValue::try_from(&value)
+                    .context("Invalid remote execution header value")?;
+                value.set_sensitive(true);
 
                 anyhow::Ok((key, value))
             })
             .collect::<Result<_, _>>()
-            .context("Error converting headers")?;
+            .context("Error converting headers")
+            .map_err(|error| {
+                error.context(REClientError {
+                    code: TCode::INVALID_ARGUMENT,
+                    message: "Invalid remote execution headers".to_owned(),
+                    group: TCodeReasonGroup::UNKNOWN,
+                })
+            })?;
 
         Ok(Self {
             headers: Arc::new(headers),
@@ -453,9 +536,9 @@ enum DigestRemoteState {
 }
 
 struct FindMissingCache {
-    cache: LruCache<TDigest, DigestRemoteState>,
-    /// To avoid a situation where we cache that an artifact is available remotely, but the artifact then expires
-    /// we clear our local cache once every `ttl`.
+    cache: LruCache<TDigest, ()>,
+    /// Optimistic upload-only knowledge. Authoritative checks always bypass
+    /// this cache; a successful lookup does not constitute a server lease.
     ttl: Duration,
     last_check: Instant,
 }
@@ -468,14 +551,28 @@ impl FindMissingCache {
         }
     }
 
-    pub fn get(&mut self, digest: &TDigest) -> Option<DigestRemoteState> {
+    pub fn get(&mut self, digest: &TDigest, allow_cached: bool) -> Option<DigestRemoteState> {
+        if !allow_cached {
+            return None;
+        }
         self.clear_if_ttl_expires();
-        self.cache.get(digest).copied()
+        self.cache
+            .get(digest)
+            .map(|()| DigestRemoteState::ExistsOnRemote)
     }
 
     pub fn put(&mut self, digest: TDigest, state: DigestRemoteState) {
         self.clear_if_ttl_expires();
-        self.cache.put(digest, state);
+        match state {
+            DigestRemoteState::ExistsOnRemote => {
+                self.cache.put(digest, ());
+            }
+            DigestRemoteState::Missing => {
+                // Uploads and completed actions can make a missing digest
+                // present immediately. Never retain negative knowledge.
+                self.cache.pop(&digest);
+            }
+        }
     }
 }
 
@@ -638,10 +735,17 @@ fn normalize_re_error(err: anyhow::Error) -> anyhow::Error {
     }) else {
         return err;
     };
+    let group = if status.code() == tonic::Code::FailedPrecondition {
+        Status::decode(status.details())
+            .ok()
+            .map_or(TCodeReasonGroup::UNKNOWN, |s| status_reason_group(&s))
+    } else {
+        TCodeReasonGroup::UNKNOWN
+    };
     let re_error = REClientError {
         code: TCode(status.code() as i32),
         message: status.message().to_owned(),
-        group: TCodeReasonGroup::UNKNOWN,
+        group,
     };
     err.context(re_error)
 }
@@ -846,12 +950,7 @@ impl REClient {
                     .context("Missing `result` when message was `done`")?
                 {
                     OpResult::Error(rpc_status) => {
-                        return Err(REClientError {
-                            code: TCode(rpc_status.code),
-                            message: rpc_status.message,
-                            group: TCodeReasonGroup::UNKNOWN,
-                        }
-                        .into());
+                        return Err(error_from_status(rpc_status).into());
                     }
                     OpResult::Response(any) => {
                         let execute_response_grpc: GExecuteResponse =
@@ -1070,7 +1169,9 @@ impl REClient {
             {
                 let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
                 for digest in digest_iter.by_ref() {
-                    if let Some(rs) = find_missing_cache.get(digest) {
+                    if let Some(rs) =
+                        find_missing_cache.get(digest, request.is_for_upload.unwrap_or(false))
+                    {
                         // We have our final result already cached
                         remote_results.insert(digest.clone(), rs);
                     } else {
@@ -1967,7 +2068,14 @@ fn substitute_env_vars_impl(
     for mat in ENV_REGEX.find_iter(s) {
         out.push_str(&s[last_idx..mat.start()]);
         let var = &mat.as_str()[1..];
-        let val = getter(var).with_context(|| format!("Error substituting `{}`", mat.as_str()))?;
+        let val = getter(var).map_err(|error| match error {
+            VarError::NotPresent => {
+                anyhow::anyhow!("Missing environment variable in remote execution header")
+            }
+            VarError::NotUnicode(_) => {
+                anyhow::anyhow!("Non-UTF-8 environment variable in remote execution header")
+            }
+        })?;
         out.push_str(&val);
         last_idx = mat.end();
     }
@@ -1988,6 +2096,160 @@ mod tests {
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_response;
 
     use super::*;
+
+    fn missing_input_status(violation_type: &str, subject: &str) -> Status {
+        Status {
+            code: TCode::FAILED_PRECONDITION.0,
+            message: "arbitrary server wording".to_owned(),
+            details: vec![prost_types::Any {
+                type_url: "type.googleapis.com/google.rpc.PreconditionFailure".to_owned(),
+                value: PreconditionFailure {
+                    violations: vec![PreconditionViolation {
+                        r#type: violation_type.to_owned(),
+                        subject: subject.to_owned(),
+                    }],
+                }
+                .encode_to_vec(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_missing_input_status_preserves_typed_reason() {
+        for subject in [
+            "blobs/aa/0",
+            "blobs/blake3/aa/42",
+            "blobs/06a608a5c67942e55c50f43515ae137009100547be310fbffb056871fd12e78f/986808",
+        ] {
+            let status = missing_input_status("MISSING", subject);
+            let operation_error = error_from_status(status.clone());
+            assert_eq!(operation_error.code, TCode::FAILED_PRECONDITION);
+            assert_eq!(operation_error.group, TCodeReasonGroup::DIGEST_NOT_FOUND);
+            let response = GExecuteResponse {
+                status: Some(status),
+                ..Default::default()
+            };
+            let encoded = response.encode_to_vec();
+            let response = GExecuteResponse::decode(encoded.as_slice()).unwrap();
+            let error = check_status(response.status.unwrap()).unwrap_err();
+            assert_eq!(error.group, TCodeReasonGroup::DIGEST_NOT_FOUND);
+        }
+    }
+
+    #[test]
+    fn test_missing_input_requires_valid_structured_blob_violation() {
+        for (violation_type, subject) in [
+            ("OTHER", "blobs/aa/1"),
+            ("MISSING", "workers/default"),
+            ("MISSING", "blobs//1"),
+            ("MISSING", "blobs/not-a-hash/1"),
+            ("MISSING", "blobs/aa/-1"),
+            ("MISSING", "blobs/aa/+1"),
+            ("MISSING", "blobs/aa/9223372036854775808"),
+            ("MISSING", "blobs/aa/1/extra"),
+        ] {
+            assert_eq!(
+                status_reason_group(&missing_input_status(violation_type, subject)),
+                TCodeReasonGroup::UNKNOWN,
+                "{violation_type}: {subject}",
+            );
+        }
+        let mut status = missing_input_status("MISSING", "blobs/aa/1");
+        for code in [
+            TCode::NOT_FOUND,
+            TCode::UNAUTHENTICATED,
+            TCode::PERMISSION_DENIED,
+            TCode::INTERNAL,
+        ] {
+            status.code = code.0;
+            assert_eq!(status_reason_group(&status), TCodeReasonGroup::UNKNOWN);
+        }
+        status.code = TCode::FAILED_PRECONDITION.0;
+        status.details[0].value = vec![0xff];
+        assert_eq!(status_reason_group(&status), TCodeReasonGroup::UNKNOWN);
+        status.details.clear();
+        status.message = "action input missing from CAS: blobs/aa/1".to_owned();
+        assert_eq!(status_reason_group(&status), TCodeReasonGroup::UNKNOWN);
+    }
+
+    #[test]
+    fn test_missing_input_rejects_mixed_preconditions() {
+        let mut status = missing_input_status("MISSING", "blobs/aa/1");
+        status.details.extend(missing_input_status("OTHER", "workers/pool").details);
+        assert_eq!(status_reason_group(&status), TCodeReasonGroup::UNKNOWN);
+        let mut status = missing_input_status("MISSING", "blobs/aa/1");
+        status.details[0].type_url = "type.example/PreconditionFailure".to_owned();
+        assert_eq!(status_reason_group(&status), TCodeReasonGroup::UNKNOWN);
+    }
+
+    #[tokio::test]
+    async fn test_missing_input_is_classified_without_rpc_retries() {
+        for (outer_code, inner_code, expected_group) in [
+            (
+                tonic::Code::FailedPrecondition,
+                TCode::FAILED_PRECONDITION,
+                TCodeReasonGroup::DIGEST_NOT_FOUND,
+            ),
+            (
+                tonic::Code::Unauthenticated,
+                TCode::FAILED_PRECONDITION,
+                TCodeReasonGroup::UNKNOWN,
+            ),
+            (
+                tonic::Code::PermissionDenied,
+                TCode::FAILED_PRECONDITION,
+                TCodeReasonGroup::UNKNOWN,
+            ),
+            (
+                tonic::Code::FailedPrecondition,
+                TCode::UNAUTHENTICATED,
+                TCodeReasonGroup::UNKNOWN,
+            ),
+        ] {
+            let mut status = missing_input_status("MISSING", "blobs/aa/1");
+            status.code = inner_code.0;
+            let details = prost::bytes::Bytes::from(status.encode_to_vec());
+            let attempts = AtomicU16::new(0);
+            let error = retry(|| async {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err::<(), _>(anyhow::Error::new(tonic::Status::with_details(
+                    outer_code,
+                    "arbitrary server wording",
+                    details.clone(),
+                )))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(attempts.load(Ordering::Relaxed), 1);
+            let classified = error.downcast_ref::<REClientError>().unwrap();
+            assert_eq!(classified.code, TCode(outer_code as i32));
+            assert_eq!(classified.group, expected_group);
+            assert!(error.downcast_ref::<tonic::Status>().is_some());
+        }
+    }
+
+    #[test]
+    fn test_authoritative_presence_bypasses_cache_and_misses_are_not_cached() {
+        let digest = TDigest {
+            hash: "aa".to_owned(),
+            size_in_bytes: 1,
+            ..Default::default()
+        };
+        let mut cache = FindMissingCache {
+            cache: LruCache::new(NonZeroUsize::new(8).unwrap()),
+            ttl: Duration::from_secs(60),
+            last_check: Instant::now(),
+        };
+        cache.put(digest.clone(), DigestRemoteState::ExistsOnRemote);
+        assert!(matches!(
+            cache.get(&digest, true),
+            Some(DigestRemoteState::ExistsOnRemote)
+        ));
+        assert!(cache.get(&digest, false).is_none());
+        cache.put(digest.clone(), DigestRemoteState::Missing);
+        assert!(cache.get(&digest, true).is_none());
+        assert!(cache.get(&digest, false).is_none());
+    }
 
     // Exercise h2's actual frame handling: Error::from(Reason) does not retain
     // whether an error was a GOAWAY, a reset, or remotely initiated.
@@ -3241,6 +3503,54 @@ mod tests {
         .await?;
 
         Ok(())
+    }
+
+    #[test]
+    fn test_header_credentials_are_sensitive() {
+        let secret = "private-header-credential";
+        let mut interceptor = InjectHeadersInterceptor::new(&[HttpHeader {
+            key: "authorization".to_owned(),
+            value: secret.to_owned(),
+        }])
+        .unwrap();
+        let request = interceptor.call(tonic::Request::new(())).unwrap();
+        let value = request.metadata().get("authorization").unwrap();
+        assert_eq!(value.to_str().unwrap(), secret);
+        assert!(value.is_sensitive());
+        assert!(!format!("{:?}", request.metadata()).contains(secret));
+    }
+
+    #[test]
+    fn test_invalid_header_diagnostics_omit_credentials() {
+        let secret = "private-header-credential";
+        for (key, value) in [
+            ("invalid\nkey", secret.to_owned()),
+            ("authorization", format!("{secret}\n")),
+        ] {
+            let error = InjectHeadersInterceptor::new(&[HttpHeader {
+                key: key.to_owned(),
+                value,
+            }])
+            .err()
+            .expect("invalid header must fail");
+            assert_eq!(
+                error.downcast_ref::<REClientError>().unwrap().code,
+                TCode::INVALID_ARGUMENT,
+            );
+            assert!(!format!("{error:#}").contains(secret));
+            assert!(!format!("{error:?}").contains(secret));
+        }
+    }
+
+    #[test]
+    fn test_header_environment_errors_omit_credentials() {
+        let secret = "private-header-credential";
+        let error = substitute_env_vars_impl("$TOKEN", |_| {
+            Err(VarError::NotUnicode(secret.into()))
+        })
+        .unwrap_err();
+        assert!(!format!("{error:#}").contains(secret));
+        assert!(!format!("{error:?}").contains(secret));
     }
 
     #[test]

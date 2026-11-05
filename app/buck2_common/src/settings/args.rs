@@ -11,14 +11,14 @@
 #[derive(buck2_error::Error, Debug)]
 #[buck2(input)]
 enum SettingsArgumentError {
-    #[error("Could not find equals sign (`=`) in setting `{0}`")]
-    NoEqualsSeparator(String),
-    #[error("Expected a value after `=` in setting `{0}`")]
-    MissingValue(String),
-    #[error("Expected `section.key`, but got `{0}`")]
-    InvalidSectionAndKey(String),
-    #[error("Expected one key-value pair, but got `{0}`")]
-    MultipleKeyValuePairs(String),
+    #[error("Could not find equals sign (`=`); expected `section.key=value`")]
+    NoEqualsSeparator,
+    #[error("Expected a value after `=` in setting")]
+    MissingValue,
+    #[error("Expected a valid `section.key` in setting")]
+    InvalidSectionAndKey,
+    #[error("Expected one key-value pair in setting")]
+    MultipleKeyValuePairs,
 }
 
 /// A settings layer parsed from a single `--setting` argument.
@@ -36,14 +36,14 @@ impl SettingOverride {
 pub fn parse_setting_flag_arg(raw: &str) -> buck2_error::Result<SettingOverride> {
     let (raw_section_and_key, raw_value) = raw
         .split_once('=')
-        .ok_or_else(|| SettingsArgumentError::NoEqualsSeparator(raw.to_owned()))?;
+        .ok_or(SettingsArgumentError::NoEqualsSeparator)?;
 
     if raw_value.is_empty() {
-        return Err(SettingsArgumentError::MissingValue(raw.to_owned()).into());
+        return Err(SettingsArgumentError::MissingValue.into());
     }
     let (section, key) = parse_setting_section_and_key(raw_section_and_key)?;
 
-    let value = parse_setting_value(raw_value, raw)?;
+    let value = parse_setting_value(raw_value)?;
 
     let mut section_table = toml::Table::new();
     section_table.insert(key.to_owned(), value);
@@ -54,9 +54,7 @@ pub fn parse_setting_flag_arg(raw: &str) -> buck2_error::Result<SettingOverride>
 
 fn parse_setting_section_and_key(raw_section_and_key: &str) -> buck2_error::Result<(&str, &str)> {
     let Some((section, key)) = raw_section_and_key.split_once('.') else {
-        return Err(
-            SettingsArgumentError::InvalidSectionAndKey(raw_section_and_key.to_owned()).into(),
-        );
+        return Err(SettingsArgumentError::InvalidSectionAndKey.into());
     };
 
     if section.is_empty()
@@ -64,20 +62,18 @@ fn parse_setting_section_and_key(raw_section_and_key: &str) -> buck2_error::Resu
         || key.contains('.')
         || raw_section_and_key.chars().any(char::is_whitespace)
     {
-        return Err(
-            SettingsArgumentError::InvalidSectionAndKey(raw_section_and_key.to_owned()).into(),
-        );
+        return Err(SettingsArgumentError::InvalidSectionAndKey.into());
     }
 
     Ok((section, key))
 }
 
-fn parse_setting_value(raw_value: &str, raw_arg: &str) -> buck2_error::Result<toml::Value> {
+fn parse_setting_value(raw_value: &str) -> buck2_error::Result<toml::Value> {
     let Ok(mut table) = toml::from_str::<toml::Table>(&format!("value = {raw_value}")) else {
         return Ok(toml::Value::String(raw_value.to_owned()));
     };
     if table.len() != 1 {
-        return Err(SettingsArgumentError::MultipleKeyValuePairs(raw_arg.to_owned()).into());
+        return Err(SettingsArgumentError::MultipleKeyValuePairs.into());
     }
     Ok(table
         .remove("value")
@@ -88,6 +84,19 @@ fn parse_setting_value(raw_value: &str, raw_arg: &str) -> buck2_error::Result<to
 mod tests {
     use super::*;
     use crate::settings::parser::table;
+
+    #[test]
+    fn malformed_setting_diagnostics_do_not_echo_values() {
+        for argument in [
+            "synthetic-setting-credential",
+            "synthetic-setting-credential=",
+            "synthetic-setting-credential==",
+            "ordinary.choice=1\nanother = \"synthetic-setting-credential\"",
+        ] {
+            let error = parse_setting_flag_arg(argument).unwrap_err();
+            assert!(!format!("{error:#}").contains("synthetic-setting-credential"));
+        }
+    }
 
     #[test]
     fn test_parse_setting_flag_arg_valid_formats() -> buck2_error::Result<()> {

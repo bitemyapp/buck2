@@ -227,7 +227,12 @@ async fn query_action_cache_and_download_result(
     )
     .await;
 
-    let DownloadResult::Result(mut res) = res;
+    let mut res = match res {
+        DownloadResult::Result(res) => res,
+        DownloadResult::CacheMiss(manager) => {
+            return ControlFlow::Continue(manager.with_remote_action_cache_rejected(true));
+        }
+    };
     match &cache_type {
         CacheType::RemoteDepFileCache(key) => {
             tracing::trace!(

@@ -9,6 +9,7 @@
  */
 
 use allocative::Allocative;
+use buck2_core::soft_error;
 use buck2_error::ErrorTag;
 use buck2_error::TypedContext;
 use remote_execution::REClientError;
@@ -94,6 +95,35 @@ fn re_error(
     }
 }
 
+/// Only structured missing-input failures qualify for native CAS recovery.
+/// In OSS, the RE client sets this reason group from REAPI PreconditionFailure,
+/// not from a status message or from FAILED_PRECONDITION alone.
+pub fn is_missing_cas_input(error: &buck2_error::Error) -> bool {
+    error
+        .find_typed_context::<RemoteExecutionError>()
+        .is_some_and(|error| {
+            error.code == TCode::FAILED_PRECONDITION
+                && error.group == TCodeReasonGroup::DIGEST_NOT_FOUND
+        })
+}
+
+/// Reuse the native, single-restart recovery boundary. A new daemon discards
+/// stale DICE values and presence leases; cache candidates are checked against
+/// CAS before their outputs can be accepted again.
+pub fn report_cas_corruption(
+    error: buck2_error::Error,
+    action_cache_is_corrupted: bool,
+) -> buck2_error::Error {
+    soft_error!(
+        "cas_missing_recovery",
+        error.clone(),
+        daemon_in_memory_state_is_corrupted: true,
+        action_cache_is_corrupted: action_cache_is_corrupted
+    )
+    .err()
+    .unwrap_or(error)
+}
+
 pub(crate) fn with_error_handler<T>(
     re_action: &str,
     re_session_id: &str,
@@ -147,5 +177,33 @@ mod tests {
 
         let err = error.find_typed_context::<RemoteExecutionError>().unwrap();
         assert_eq!(err.code, TCode::UNKNOWN);
+    }
+
+    #[test]
+    fn test_missing_cas_requires_typed_reason_and_code() {
+        let error = with_error_handler::<()>(
+            "execute",
+            "test",
+            Err(REClientError {
+                code: TCode::FAILED_PRECONDITION,
+                group: TCodeReasonGroup::DIGEST_NOT_FOUND,
+                message: "arbitrary server wording".to_owned(),
+            }
+            .into()),
+        )
+        .unwrap_err();
+        assert!(is_missing_cas_input(&error));
+        for (code, group) in [
+            (TCode::FAILED_PRECONDITION, TCodeReasonGroup::UNKNOWN),
+            (TCode::UNAUTHENTICATED, TCodeReasonGroup::DIGEST_NOT_FOUND),
+            (TCode::PERMISSION_DENIED, TCodeReasonGroup::DIGEST_NOT_FOUND),
+            (TCode::NOT_FOUND, TCodeReasonGroup::UNKNOWN),
+        ] {
+            assert!(!is_missing_cas_input(&test_re_error_with_group(
+                "action input missing from CAS",
+                code,
+                group,
+            )));
+        }
     }
 }

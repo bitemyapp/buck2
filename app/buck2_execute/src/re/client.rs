@@ -262,9 +262,19 @@ impl RemoteExecutionClient {
             match Self::new(re_config).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    if e.find_typed_context::<RemoteExecutionError>().is_none() {
-                        // If we cannot connect to RE due to some non-RE error, we should not retry
-                        // And should just return the error immediately as it's unlikely to be flakey
+                    if e
+                        .find_typed_context::<RemoteExecutionError>()
+                        .is_none_or(|error| {
+                            matches!(
+                                error.code,
+                                TCode::UNAUTHENTICATED
+                                    | TCode::PERMISSION_DENIED
+                                    | TCode::INVALID_ARGUMENT
+                            )
+                        })
+                    {
+                        // Non-RE errors, invalid configuration and rejected
+                        // credentials cannot be repaired by reconnecting.
                         return Err(e);
                     }
 

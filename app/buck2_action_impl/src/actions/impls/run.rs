@@ -1287,6 +1287,7 @@ impl RunAction {
                         .action
                         .coerce();
                     let req = req.with_remote_dep_file_key(&remote_dep_file_key);
+                    let remote_action_cache_rejected = manager.inner.remote_action_cache_rejected;
                     let remote_dep_file_result = ctx
                         .remote_dep_file_cache(manager, &req, &prepared_action)
                         .await;
@@ -1305,7 +1306,10 @@ impl RunAction {
                             .await?;
                         (
                             req,
-                            res.map_continue(|_| ctx.command_execution_manager(WaitingData::new())),
+                            res.map_continue(|_| {
+                                ctx.command_execution_manager(WaitingData::new())
+                                    .with_remote_action_cache_rejected(remote_action_cache_rejected)
+                            }),
                         )
                     } else {
                         (req, remote_dep_file_result)

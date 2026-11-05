@@ -28,7 +28,7 @@ fn configuration_info_validates_buckconfigs() -> buck2_error::Result<()> {
             )
         "#
         ),
-        "Could not find section separator (`.`) in pair `applekey`",
+        "Could not find section separator (`.`); expected `section.key`",
     );
 
     tester.run_starlark_bzl_test(indoc!(
@@ -61,7 +61,7 @@ fn configuration_info_validates_root_buckconfigs() -> buck2_error::Result<()> {
             )
         "#
         ),
-        "Could not find section separator (`.`) in pair `applekey`",
+        "Could not find section separator (`.`); expected `section.key`",
     );
 
     tester.run_starlark_bzl_test_expecting_error(

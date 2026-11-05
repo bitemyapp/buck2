@@ -86,16 +86,16 @@ pub struct ConfigSectionAndKey {
 #[derive(buck2_error::Error, Debug)]
 #[buck2(input)]
 pub(crate) enum ConfigArgumentParseError {
-    #[error("Could not find section separator (`.`) in pair `{0}`")]
-    NoSectionDotSeparator(String),
-    #[error("Could not find equals sign (`=`) in pair `{0}`")]
-    NoEqualsSeparator(String),
+    #[error("Could not find section separator (`.`); expected `section.key`")]
+    NoSectionDotSeparator,
+    #[error("Could not find equals sign (`=`); expected `section.key=value`")]
+    NoEqualsSeparator,
 
-    #[error("Expected key-value in format of `section.key=value` but only got `{0}`")]
-    MissingData(String),
+    #[error("Expected a nonempty section and key in `section.key=value`")]
+    MissingData,
 
-    #[error("Contains whitespace in key-value pair `{0}`")]
-    WhitespaceInKeyOrValue(String),
+    #[error("Contains whitespace in configuration section or key")]
+    WhitespaceInKeyOrValue,
 
     #[error("Specifying cells via cli config overrides is banned (`{0}.key=value`)")]
     CellOverrideViaCliConfig(&'static str),
@@ -104,30 +104,34 @@ pub(crate) enum ConfigArgumentParseError {
 // Parses config key in the format `section.key`
 pub fn parse_config_section_and_key(
     raw_section_and_key: &str,
-    raw_arg_in_err: Option<&str>, // Used in error strings to preserve the original config argument, not just section and key
 ) -> buck2_error::Result<ConfigSectionAndKey> {
-    let raw_arg = raw_arg_in_err.unwrap_or(raw_section_and_key);
+    let (section, key) = split_config_section_and_key(raw_section_and_key)?;
+    Ok(ConfigSectionAndKey {
+        section: section.to_owned(),
+        key: key.to_owned(),
+    })
+}
+
+/// Shared validation for execution and privacy-safe identifier retention. Errors
+/// deliberately contain no unvalidated input, which may itself be a credential.
+pub(crate) fn split_config_section_and_key(
+    raw_section_and_key: &str,
+) -> Result<(&str, &str), ConfigArgumentParseError> {
     let (raw_section, raw_key) = raw_section_and_key
         .split_once('.')
-        .ok_or_else(|| ConfigArgumentParseError::NoSectionDotSeparator(raw_arg.to_owned()))?;
+        .ok_or(ConfigArgumentParseError::NoSectionDotSeparator)?;
 
-    // We only trim the section + key, whitespace in values needs to be preserved. For example,
-    // Buck can be invoked with --config section.key="Some Value" that contains important whitespace.
+    // Leading section whitespace is accepted by the existing config grammar.
     let trimmed_section = raw_section.trim_start();
     if trimmed_section.find(char::is_whitespace).is_some()
         || raw_key.find(char::is_whitespace).is_some()
     {
-        return Err(ConfigArgumentParseError::WhitespaceInKeyOrValue(raw_arg.to_owned()).into());
+        return Err(ConfigArgumentParseError::WhitespaceInKeyOrValue);
     }
-
     if trimmed_section.is_empty() || raw_key.is_empty() {
-        return Err(ConfigArgumentParseError::MissingData(raw_arg.to_owned()).into());
+        return Err(ConfigArgumentParseError::MissingData);
     }
-
-    Ok(ConfigSectionAndKey {
-        section: trimmed_section.to_owned(),
-        key: raw_key.to_owned(),
-    })
+    Ok((trimmed_section, raw_key))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Allocative, Pagable)]
@@ -778,23 +782,23 @@ pub(crate) mod tests {
     fn test_section_and_key() -> buck2_error::Result<()> {
         // Valid Formats
 
-        let normal_section_and_key = parse_config_section_and_key("apple.key", None)?;
+        let normal_section_and_key = parse_config_section_and_key("apple.key")?;
 
         assert_eq!("apple", normal_section_and_key.section);
         assert_eq!("key", normal_section_and_key.key);
 
         // Whitespace
 
-        let section_leading_whitespace = parse_config_section_and_key("  apple.key", None)?;
+        let section_leading_whitespace = parse_config_section_and_key("  apple.key")?;
         assert_eq!("apple", section_leading_whitespace.section);
         assert_eq!("key", section_leading_whitespace.key);
 
-        let pair_with_whitespace_in_key = parse_config_section_and_key("apple. key", None);
+        let pair_with_whitespace_in_key = parse_config_section_and_key("apple. key");
         assert!(pair_with_whitespace_in_key.is_err());
 
         // Invalid Formats
 
-        let pair_without_dot = parse_config_section_and_key("applekey", None);
+        let pair_without_dot = parse_config_section_and_key("applekey");
         assert!(pair_without_dot.is_err());
 
         Ok(())

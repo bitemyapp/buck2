@@ -45,20 +45,20 @@ mod resolver;
 #[derive(buck2_error::Error, Debug)]
 #[buck2(input)]
 enum ConfigError {
-    #[error("Expected line of the form `key = value` but key was empty. Line was `{0}`")]
-    EmptyKey(String),
+    #[error("Expected line of the form `key = value` but key was empty")]
+    EmptyKey,
     #[error("Included file doesn't exist `{0}`")]
     MissingInclude(String),
-    #[error("Improperly formatted section. Expected something of the form `[section]`, got {0}")]
-    SectionMissingTrailingBracket(String),
-    #[error("Improperly include directive path. Got {0}")]
-    BadIncludePath(String),
+    #[error("Improperly formatted section. Expected something of the form `[section]`")]
+    SectionMissingTrailingBracket,
+    #[error("Improperly formatted include directive path")]
+    BadIncludePath,
     #[error("Detected a cycle in buckconfig includes: `{0}` is already being parsed")]
     IncludeCycle(String),
     #[error(
-        "Couldn't parse line. Expected include directive (`<file:/file.bcfg>`), section(`[some_section]`), or key assignment (`some_key = some_value`). Got `{0}`"
+        "Couldn't parse line. Expected include directive (`<file:/file.bcfg>`), section(`[some_section]`), or key assignment (`some_key = some_value`)"
     )]
-    InvalidLine(String),
+    InvalidLine,
     #[error("Detected cycles in buckconfig $(config) references: {}", format_cycle(.0))]
     ReferenceCycle(Vec<(String, String)>),
 }
@@ -331,7 +331,7 @@ impl<'p> LegacyConfigFileParser<'p> {
         // using oss-enable/oss-disable is super tricky
         match line.strip_prefix('[') {
             Some(remaining) => match Self::strip_line_comment(remaining).strip_suffix(']') {
-                None => Err(ConfigError::SectionMissingTrailingBracket(line.to_owned()).into()),
+                None => Err(ConfigError::SectionMissingTrailingBracket.into()),
                 Some(section) => Ok(Some(section)),
             },
             None => Ok(None),
@@ -381,7 +381,7 @@ impl<'p> LegacyConfigFileParser<'p> {
                 let key = key.trim();
                 let val = val.trim();
                 if key.is_empty() {
-                    return Err(ConfigError::EmptyKey(line.to_owned()).into());
+                    return Err(ConfigError::EmptyKey.into());
                 }
                 self.current_section.1.insert(
                     key.to_owned(),
@@ -406,7 +406,7 @@ impl<'p> LegacyConfigFileParser<'p> {
                         match config_path.join_to_parent_normalized(relative) {
                             Ok(d) => d,
                             Err(_) => {
-                                return Err(ConfigError::BadIncludePath(include.to_owned()).into());
+                                return Err(ConfigError::BadIncludePath.into());
                             }
                         }
                     };
@@ -422,7 +422,7 @@ impl<'p> LegacyConfigFileParser<'p> {
                     }
                 }
             } else {
-                return Err(ConfigError::InvalidLine(line.to_owned()).into());
+                return Err(ConfigError::InvalidLine.into());
             }
         }
         Ok(())

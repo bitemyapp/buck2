@@ -14,6 +14,8 @@ import json
 import os
 import signal
 
+import pytest
+
 from buck2.tests.e2e_util.api.buck import Buck
 from buck2.tests.e2e_util.asserts import expect_failure
 from buck2.tests.e2e_util.buck_workspace import buck_test
@@ -55,7 +57,8 @@ async def test_restart_materializer_corruption(buck: Buck) -> None:
 
 
 @buck_test(allow_soft_errors=True)
-async def test_restart_cas_missing(buck: Buck) -> None:
+@pytest.mark.parametrize("target", ["//:stage1", "//:stage2"])
+async def test_restart_cas_missing(buck: Buck, target: str) -> None:
     # Make sure Buck is not running.
     await buck.kill()
 
@@ -63,13 +66,26 @@ async def test_restart_cas_missing(buck: Buck) -> None:
     # This is just the hash of `src`.
     await buck.build(env={"BUCK2_TEST_TOMBSTONED_DIGESTS": TEST_DIGEST})
 
-    # Now build //:stage2. Buck2 must try to download the file, fail, then
-    # restart the daemon.
-    res = await buck.build("//:stage2")
+    # Exercise both a final output and an input needed by a local action.
+    # Both must restart the daemon after the typed CAS download failure.
+    res = await buck.build(target)
     assert "Your command will now restart" in res.stderr
 
-    # TODO: We should also handle the case where the top-level artifact is what
-    # fails to download (i.e. build stage1 here instead).
+
+@buck_test(allow_soft_errors=True)
+@pytest.mark.parametrize("target", ["//:stage1", "//:stage2"])
+async def test_restart_persistent_cas_missing_is_bounded(buck: Buck, target: str) -> None:
+    await buck.kill()
+    # Keep the typed missing-download failure active in both daemons. Recovery
+    # must give up after one restart, including for an input to a local action.
+    res = await expect_failure(
+        buck.build(
+            target,
+            "--prefer-remote",
+            env={"BUCK2_TEST_FAIL_RE_DOWNLOADS": "true"},
+        ),
+    )
+    assert res.stderr.count("Your command will now restart") == 1
 
 
 @buck_test(

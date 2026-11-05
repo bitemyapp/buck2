@@ -220,10 +220,10 @@ fn configuration_info_creator(globals: &mut GlobalsBuilder) {
         let new_constraints = build_constraints_map_from_dict(constraints)?;
 
         for (k, _) in &values.typed.entries {
-            parse_config_section_and_key(k, None)?;
+            parse_config_section_and_key(k)?;
         }
         for (k, _) in &root_values.typed.entries {
-            parse_config_section_and_key(k, None)?;
+            parse_config_section_and_key(k)?;
         }
 
         let value_keys: BuckMutSet<&str> = values.typed.entries.iter().map(|(k, _)| *k).collect();

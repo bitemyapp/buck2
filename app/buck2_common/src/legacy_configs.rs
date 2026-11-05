@@ -23,4 +23,5 @@ pub mod file_ops;
 pub mod key;
 mod parser;
 pub(crate) mod path;
+pub mod telemetry;
 pub mod view;
