@@ -634,6 +634,13 @@ async fn get_project_buckconfig_paths(
         }
     }
 
+    // Apply an explicit external layer at startup as well as during commands.
+    // RE clients are initialized before invocation-only --config-file arguments.
+    // Effective RE config changes are part of the daemon startup identity.
+    if let Some(path) = buck2_env!("BUCK2_EXTRA_EXTERNAL_CONFIG")? {
+        buckconfig_paths.push(ConfigPath::Global(AbsPath::new(path)?.to_owned()));
+    }
+
     Ok(buckconfig_paths)
 }
 

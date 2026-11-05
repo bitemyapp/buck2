@@ -12,3 +12,4 @@ pub mod artifact_type;
 pub mod deferred;
 pub mod immediate;
 pub mod io;
+pub(crate) mod local_content_store;

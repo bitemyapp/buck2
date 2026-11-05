@@ -142,8 +142,13 @@ impl<'a> ImmediateConfigContext<'a> {
                     }
                 };
 
-                DaemonStartupConfig::new(&data.root_config, &buck_settings, paranoid)
-                    .buck_error_context("Error loading daemon startup config")
+                DaemonStartupConfig::new(
+                    &data.root_config,
+                    &buck_settings,
+                    paranoid,
+                    data.project_filesystem.root().as_path(),
+                )
+                .buck_error_context("Error loading daemon startup config")
             })
             .buck_error_context("Error creating daemon startup config")
     }
@@ -267,6 +272,44 @@ mod tests {
 
     fn working_dir(path: &AbsPath) -> buck2_error::Result<AbsWorkingDir> {
         Ok(AbsWorkingDir::unchecked_new(fs_util::canonicalize(path)?))
+    }
+
+    #[test]
+    fn test_relative_re_tls_uses_project_root_from_subdirectory() -> buck2_error::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = AbsPath::new(tempdir.path())?;
+        fs_util::write(
+            root.join(".buckconfig"),
+            "[cells]\nroot = .\n[buck2_re_client]\ntls_ca_certs = cert.pem\n",
+        )?;
+        fs_util::write(root.join("cert.pem"), "first certificate")?;
+        let nested = root.join("nested");
+        fs_util::create_dir_all(&nested)?;
+        let root_cwd = working_dir(root)?;
+        let nested_cwd = working_dir(&nested)?;
+        let root_context = ImmediateConfigContext::new(&root_cwd);
+        let nested_context = ImmediateConfigContext::new(&nested_cwd);
+        root_context.set_setting_arg_layers(Vec::new())?;
+        nested_context.set_setting_arg_layers(Vec::new())?;
+        let initial = &root_context
+            .daemon_startup_config()?
+            .remote_execution_config_digest;
+        assert_eq!(
+            initial,
+            &nested_context
+                .daemon_startup_config()?
+                .remote_execution_config_digest,
+        );
+        fs_util::write(root.join("cert.pem"), "rotated certificate")?;
+        let rotated = ImmediateConfigContext::new(&nested_cwd);
+        rotated.set_setting_arg_layers(Vec::new())?;
+        assert_ne!(
+            initial,
+            &rotated
+                .daemon_startup_config()?
+                .remote_execution_config_digest
+        );
+        Ok(())
     }
 
     #[test]

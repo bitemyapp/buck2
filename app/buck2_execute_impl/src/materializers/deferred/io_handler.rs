@@ -205,35 +205,43 @@ impl DefaultIoHandler {
         // Materialize files
         match method.as_ref() {
             ArtifactMaterializationMethod::CasDownload { info } => {
-                let mut files = Vec::new();
-
-                {
-                    let mut walk = unordered_entry_walk(entry.as_ref().map_dir(Directory::as_ref));
-
-                    while let Some((entry_path, entry)) = walk.next() {
-                        if let DirectoryEntry::Leaf(ActionDirectoryMember::File(f)) = entry {
-                            let name = path.join(entry_path.get());
-                            let digest = maybe_tombstone_digest(f.digest.data())?.to_re();
-
-                            tracing::trace!(name = %name, digest = %digest, "push download");
-                            let name = self
-                                .fs
-                                .resolve(&name)
-                                .as_maybe_relativized_str()?
-                                .to_owned();
-
-                            files.push(NamedDigestWithPermissions {
-                                named_digest: NamedDigest {
-                                    name,
-                                    digest,
+                let (files, missing) = self
+                    .io_executor
+                    .execute_io_inline(|| {
+                        let mut files = Vec::new();
+                        let mut missing = Vec::new();
+                        let mut walk =
+                            unordered_entry_walk(entry.as_ref().map_dir(Directory::as_ref));
+                        while let Some((entry_path, entry)) = walk.next() {
+                            if let DirectoryEntry::Leaf(ActionDirectoryMember::File(f)) = entry {
+                                let name = path.join(entry_path.get());
+                                let absolute = self.fs.resolve(&name);
+                                let Some(download) =
+                                    crate::materializers::local_content_store::Download::prepare(
+                                        absolute,
+                                        f.dupe(),
+                                        self.digest_config,
+                                    )?
+                                else {
+                                    continue;
+                                };
+                                let digest = maybe_tombstone_digest(f.digest.data())?.to_re();
+                                let name = download.name()?;
+                                missing.push(download);
+                                files.push(NamedDigestWithPermissions {
+                                    named_digest: NamedDigest {
+                                        name,
+                                        digest,
+                                        ..Default::default()
+                                    },
+                                    is_executable: f.is_executable,
                                     ..Default::default()
-                                },
-                                is_executable: f.is_executable,
-                                ..Default::default()
-                            });
+                                });
+                            }
                         }
-                    }
-                }
+                        buck2_error::Ok((files, missing))
+                    })
+                    .await?;
                 stat.file_count = files.len().try_into().unwrap_or_default();
                 stat.total_bytes = files
                     .iter()
@@ -265,6 +273,14 @@ impl DefaultIoHandler {
                             format!("Error materializing files declared by action: {info}")
                         })),
                     })?;
+                self.io_executor
+                    .execute_io_inline(|| {
+                        for download in missing {
+                            download.finish(self.digest_config)?;
+                        }
+                        buck2_error::Ok(())
+                    })
+                    .await?;
             }
             ArtifactMaterializationMethod::LocalCopy(_, copied_artifacts) => {
                 self.io_executor
@@ -280,6 +296,11 @@ impl DefaultIoHandler {
                                 &self.fs.root().join(&a.dest),
                                 a.executable_bit_override,
                             )?;
+                            crate::materializers::local_content_store::artifact(
+                                &self.fs.root().join(&a.dest),
+                                &a.dest_entry,
+                                self.digest_config,
+                            )?;
                         }
                         Ok(())
                     })
@@ -293,7 +314,12 @@ impl DefaultIoHandler {
                             zstd::bulk::decompress(&write.compressed_data, write.decompressed_size)
                                 .buck_error_context("Error decompressing data")?;
                         stat.total_bytes = write.decompressed_size as u64;
-                        self.fs.write_file(&path, data, write.is_executable)
+                        self.fs.write_file(&path, data, write.is_executable)?;
+                        crate::materializers::local_content_store::artifact(
+                            &self.fs.resolve(&path),
+                            &entry,
+                            self.digest_config,
+                        )
                     })
                     .await?;
             }

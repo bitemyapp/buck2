@@ -87,6 +87,43 @@ nixpkgs for inspiration for writing one. An `.envrc` using the Nix flake is
 provided for `direnv` users — `direnv allow` will give a usable development
 environment.
 
+#### Shared local artifact materialization (Linux fork)
+
+This fork can share regular-file extents across independent worktrees with
+`BUCK2_LOCAL_CONTENT_STORE=/absolute/canonical/cache/path`. Its parent must
+already exist; the store itself is created with mode `0700` and must belong
+to the daemon's UID. Set this environment before starting each Buck daemon,
+and restart those daemons after changing it. Use separate roots for separate
+trust domains. This is a private machine-local cache, not a network filesystem
+or a replacement for the remote action cache.
+
+Local action outputs, write/copy actions, HTTP outputs, and downloaded remote
+outputs enter the same content-addressed store. Materializations use reflinks,
+never writable hardlinks. Every reused snapshot is hashed against its declared
+digest before atomic file publication. Executable bits are applied to each
+materialization independently; directory and symlink metadata remain managed
+by the existing materializer. Remote downloads are staged and verified before
+publication even when the optional shared store is disabled.
+
+The store and worktree outputs must be on the same reflink-capable filesystem.
+Unsupported reflinks and artifacts exceeding the configured capacity fail
+explicitly rather than silently allocating full copies. The defaults are
+10 GiB (`BUCK2_LOCAL_CONTENT_STORE_MAX_BYTES`) and 100,000 files
+(`BUCK2_LOCAL_CONTENT_STORE_MAX_ENTRIES`). A process-shared lock and SQLite LRU
+enforce these limits during active builds, not only during idle periods.
+Eviction unlinks cache objects without invalidating existing reflinks. Startup
+recovers interrupted publications and removes orphaned staging files. A corrupt
+object is removed and the current materialization fails; a subsequent attempt
+can repopulate it from a producer or the remote CAS. Permissions are not used as
+an integrity shortcut.
+
+The capacity covers cache object logical bytes, plus filesystem block rounding,
+bounded index metadata, and one in-flight object. It does not cap live worktree
+outputs or Buck's daemon state; use the
+existing deferred-materialization and clean-stale policies for those. Separate
+worktrees can still execute identical actions concurrently; this store shares
+their resulting extents, not their action execution.
+
 ### `protoc` on non-Tier-1 platforms
 
 Buck2 uses Protocol Buffers extensively, both internally and to talk to remote

@@ -709,7 +709,7 @@ mod tests {
                 &[],
             )?;
             let config = parse_legacy_config(&[("config", "")], "config")?;
-            DaemonStartupConfig::new(&config, &settings, false)
+            DaemonStartupConfig::new(&config, &settings, false, std::path::Path::new("."))
         }
 
         #[test]
