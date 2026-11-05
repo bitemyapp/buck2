@@ -117,6 +117,13 @@ object is removed and the current materialization fails; a subsequent attempt
 can repopulate it from a producer or the remote CAS. Permissions are not used as
 an integrity shortcut.
 
+A separately entry-bounded index of weak output paths can recover shared extents
+from a still-live worktree after canonical eviction. These hints retain no file
+data and are verified before use; stale or unsafe paths are discarded. LRU and
+weak-view updates share one durable SQLite transaction. Object accounting still
+commits before canonical publication, with file and directory synchronization
+preserved.
+
 The capacity covers cache object logical bytes, plus filesystem block rounding,
 bounded index metadata, and one in-flight object. It does not cap live worktree
 outputs or Buck's daemon state; use the

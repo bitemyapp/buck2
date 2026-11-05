@@ -343,18 +343,18 @@ mod linux {
             Ok(())
         }
 
+        // Call inside the access/publication transaction so LRU and bounded
+        // weak-reference changes require one durable metadata commit.
         fn remember_view(&self, destination: &Path, key: &str) -> buck2_error::Result<()> {
             let path = destination
                 .to_str()
                 .ok_or_else(|| error("Non-UTF-8 artifact view path"))?;
-            let transaction = self.db.unchecked_transaction()?;
-            transaction.execute(
+            self.db.execute(
                 "INSERT INTO views VALUES(?1,?2,(SELECT tick FROM clock WHERE id=1))
                  ON CONFLICT(path) DO UPDATE SET key=excluded.key,used=excluded.used",
                 params![path, key],
             )?;
             self.prune_views()?;
-            transaction.commit()?;
             Ok(())
         }
 
@@ -432,8 +432,7 @@ mod linux {
                             }
                             return Err(e);
                         }
-                        self.touch(&key)?;
-                        self.remember_view(destination, &key)?;
+                        self.record_access(destination, &key)?;
                         return Ok(true);
                     }
                     Err(e) => {
@@ -470,20 +469,22 @@ mod linux {
             )?;
             fs::rename(&pending, &object)?;
             File::open(&self.root)?.sync_all()?;
-            self.touch(&key)?;
-            self.remember_view(destination, &key)?;
+            self.record_access(destination, &key)?;
             // The original output already shares this object's extents. It is
             // not hardlinked and must retain its existing executable mode.
             Ok(true)
         }
 
-        fn touch(&self, key: &str) -> buck2_error::Result<()> {
+        fn record_access(&self, destination: &Path, key: &str) -> buck2_error::Result<()> {
+            let transaction = self.db.unchecked_transaction()?;
             self.db
                 .execute_batch("UPDATE clock SET tick=tick+1 WHERE id=1;")?;
             self.db.execute(
                 "UPDATE objects SET used=(SELECT tick FROM clock WHERE id=1) WHERE key=?1",
                 [key],
             )?;
+            self.remember_view(destination, key)?;
+            transaction.commit()?;
             Ok(())
         }
     }
@@ -551,11 +552,14 @@ mod linux {
         digest: &FileDigest,
     ) -> buck2_error::Result<()> {
         with_store((), |store| {
+            let transaction = store.db.unchecked_transaction()?;
             store.db.execute(
                 "DELETE FROM views WHERE path=?1",
                 [temporary.to_str().ok_or_else(|| error("Non-UTF-8 temporary artifact path"))?],
             )?;
-            store.remember_view(destination, &Store::key(digest))
+            store.remember_view(destination, &Store::key(digest))?;
+            transaction.commit()?;
+            Ok(())
         })
     }
 
