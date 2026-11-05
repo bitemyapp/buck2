@@ -318,6 +318,26 @@ pub struct REClientBuilder;
 
 impl REClientBuilder {
     pub async fn build_and_connect(opts: &Buck2OssReConfiguration) -> anyhow::Result<REClient> {
+        let missing_address = |message: &str| REClientError {
+            code: TCode::INVALID_ARGUMENT,
+            message: message.to_owned(),
+            group: TCodeReasonGroup::UNKNOWN,
+        };
+        // Missing endpoints cannot recover through connection retries. Validate
+        // all three before reading TLS files or contacting the capabilities API.
+        let engine_address = opts
+            .engine_address
+            .as_ref()
+            .ok_or_else(|| missing_address("No engine address"))?;
+        let cas_address = opts
+            .cas_address
+            .clone()
+            .ok_or_else(|| missing_address("No CAS address"))?;
+        let action_cache_address = opts
+            .action_cache_address
+            .clone()
+            .ok_or_else(|| missing_address("No action cache address"))?;
+
         // Create channel config once (reads TLS files)
         let channel_config = ChannelConfig::new(opts)
             .await
@@ -325,7 +345,6 @@ impl REClientBuilder {
 
         // Create a single channel for fetching capabilities. Other channels are created
         // on-demand through the connection pool.
-        let engine_address = opts.engine_address.as_ref().context("No engine address")?;
         let capabilities_channel = create_channel(&channel_config, engine_address)
             .context("Error creating Capabilities channel")?;
 
@@ -384,13 +403,6 @@ impl REClientBuilder {
         } else {
             None
         };
-
-        // Extract addresses
-        let cas_address = opts.cas_address.clone().context("No CAS address")?;
-        let action_cache_address = opts
-            .action_cache_address
-            .clone()
-            .context("No action cache address")?;
 
         // Create connection pool
         let min_connections = opts.min_connections.unwrap_or(1).max(1);
@@ -3503,6 +3515,32 @@ mod tests {
         .await?;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_missing_addresses_are_configuration_errors() {
+        for missing in 0..3 {
+            let mut opts = Buck2OssReConfiguration {
+                engine_address: Some("invalid endpoint".to_owned()),
+                cas_address: Some("invalid endpoint".to_owned()),
+                action_cache_address: Some("invalid endpoint".to_owned()),
+                ..Default::default()
+            };
+            match missing {
+                0 => opts.engine_address = None,
+                1 => opts.cas_address = None,
+                2 => opts.action_cache_address = None,
+                _ => unreachable!(),
+            }
+            let error = REClientBuilder::build_and_connect(&opts)
+                .await
+                .err()
+                .expect("missing endpoint must fail before connecting");
+            assert_eq!(
+                error.downcast_ref::<REClientError>().unwrap().code,
+                TCode::INVALID_ARGUMENT,
+            );
+        }
     }
 
     #[test]

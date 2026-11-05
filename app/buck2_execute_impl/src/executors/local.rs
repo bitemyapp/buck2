@@ -1008,7 +1008,7 @@ impl LocalExecutor {
                         buck2_data::LocalStage {
                             stage: Some(buck2_data::WorkerQueued {}.into()),
                         },
-                        broker.acquire(&HostSharingRequirements::default()),
+                        broker.acquire(&HostSharingRequirements::default(), 0),
                     )
                     .await,
                 )
@@ -1239,7 +1239,7 @@ impl PreparedCommandExecutor for LocalExecutor {
                 stage: Some(buck2_data::LocalQueued {}.into()),
             },
             self.host_sharing_broker
-                .acquire(request.host_sharing_requirements()),
+                .acquire(request.host_sharing_requirements(), request.priority()),
         )
         .await;
         manager.start_waiting_category(WaitingCategory::Unknown);

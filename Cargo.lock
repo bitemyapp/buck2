@@ -6202,6 +6202,7 @@ dependencies = [
  "dashmap 6.2.1",
  "futures-intrusive",
  "pagable",
+ "parking_lot 0.12.5",
  "starlark_map",
 ]
 

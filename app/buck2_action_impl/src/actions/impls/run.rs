@@ -286,6 +286,7 @@ pub(crate) struct UnregisteredRunAction {
     pub(crate) executor_preference: ExecutorPreference,
     pub(crate) always_print_stderr: bool,
     pub(crate) weight: WeightClass,
+    pub(crate) priority: i32,
     pub(crate) low_pass_filter: bool,
     pub(crate) dep_files: RunActionDepFiles,
     // Since this is usually None, use a Box to reduce memory.
@@ -1404,6 +1405,7 @@ impl RunAction {
             .with_prefetch_lossy_stderr(true)
             .with_executor_preference(self.inner.executor_preference)
             .with_host_sharing_requirements(host_sharing_requirements.into())
+            .with_priority(self.inner.priority)
             .with_low_pass_filter(self.inner.low_pass_filter)
             .with_outputs_cleanup(!self.inner.no_outputs_cleanup)
             .with_local_environment_inheritance(EnvironmentInheritance::local_command_exclusions())

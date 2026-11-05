@@ -14,12 +14,13 @@ use std::sync::Arc;
 
 use allocative::Allocative;
 use anyhow::Context;
-use futures_intrusive::sync::SharedSemaphore;
 use futures_intrusive::sync::SharedSemaphoreReleaser;
 use pagable::Pagable;
 use starlark_map::sorted_vec::SortedVec;
 
 use crate::NamedSemaphores;
+use crate::priority_semaphore::PrioritySemaphore;
+use crate::priority_semaphore::PrioritySemaphoreGuard;
 
 const SINGLE_RUN: usize = 1;
 
@@ -121,13 +122,13 @@ impl Default for HostSharingRequirements {
 /// Keeps the data structures received from semaphores after acquiring.
 /// Semaphores are held until this struct is dropped.
 pub struct HostSharingGuard {
-    _run_guard: SharedSemaphoreReleaser,
+    _run_guard: PrioritySemaphoreGuard,
     _name_guards: Vec<SharedSemaphoreReleaser>,
 }
 
 /// Used to ensure that host resources are properly reserved before executing a command spec.
 pub struct HostSharingBroker {
-    permits: SharedSemaphore,
+    permits: PrioritySemaphore,
     num_machine_permits: usize,
     named_semaphores: Arc<NamedSemaphores>,
 }
@@ -170,12 +171,10 @@ impl HostSharingBroker {
         num_machine_permits: usize,
         named_semaphores: Arc<NamedSemaphores>,
     ) -> Self {
-        let permits = match host_sharing_strategy {
-            HostSharingStrategy::Fifo => SharedSemaphore::new(true, num_machine_permits),
-            HostSharingStrategy::SmallerTasksFirst => {
-                SharedSemaphore::new(false, num_machine_permits)
-            }
-        };
+        let permits = PrioritySemaphore::new(
+            matches!(host_sharing_strategy, HostSharingStrategy::Fifo),
+            num_machine_permits,
+        );
 
         Self {
             permits,
@@ -199,25 +198,30 @@ impl HostSharingBroker {
     pub async fn acquire(
         &self,
         host_sharing_requirements: &HostSharingRequirements,
+        priority: i32,
     ) -> HostSharingGuard {
         match host_sharing_requirements {
             HostSharingRequirements::Shared(weight_class) => {
                 let permits = self.requested_permits(weight_class).into_count();
-                self.acquire_from_permits_and_identifiers(permits, iter::empty())
+                self.acquire_from_permits_and_identifiers(permits, iter::empty(), priority)
                     .await
             }
             HostSharingRequirements::ExclusiveAccess => {
-                self.acquire_from_permits_and_identifiers(self.num_machine_permits, iter::empty())
-                    .await
+                self.acquire_from_permits_and_identifiers(
+                    self.num_machine_permits,
+                    iter::empty(),
+                    priority,
+                )
+                .await
             }
             HostSharingRequirements::OnePerToken(identifier, weight_class) => {
                 let permits = self.requested_permits(weight_class).into_count();
-                self.acquire_from_permits_and_identifiers(permits, iter::once(identifier))
+                self.acquire_from_permits_and_identifiers(permits, iter::once(identifier), priority)
                     .await
             }
             HostSharingRequirements::OnePerTokens(sorted_identifiers, weight_class) => {
                 let permits = self.requested_permits(weight_class).into_count();
-                self.acquire_from_permits_and_identifiers(permits, sorted_identifiers.iter())
+                self.acquire_from_permits_and_identifiers(permits, sorted_identifiers.iter(), priority)
                     .await
             }
         }
@@ -227,6 +231,7 @@ impl HostSharingBroker {
         &self,
         num_requested_permits: usize,
         sorted_identifiers: impl Iterator<Item = &'a String>,
+        priority: i32,
     ) -> HostSharingGuard {
         // Ensure that there is only one active run per identifier. The identifiers must be sorted
         // to avoid a potential deadlock. A repeated identifier is skipped: its semaphore has a
@@ -246,7 +251,7 @@ impl HostSharingBroker {
             let name_guard = run_semaphore.acquire(SINGLE_RUN).await;
             name_guards.push(name_guard);
         }
-        let run_guard = self.permits.acquire(num_requested_permits).await;
+        let run_guard = self.permits.acquire(num_requested_permits, priority).await;
 
         HostSharingGuard {
             _run_guard: run_guard,
@@ -255,7 +260,7 @@ impl HostSharingBroker {
     }
 }
 
-/// Determines whether a fair or unfair semaphore is used to manage host sharing
+/// Determines the admission policy among waiters with equal scheduling priority.
 pub enum HostSharingStrategy {
     SmallerTasksFirst,
     Fifo,
@@ -300,7 +305,7 @@ mod tests {
         // Nothing is held, so distinct tokens are acquired on the first poll.
         let distinct = requirements(&["a", "b"]);
         assert!(
-            std::pin::pin!(broker.acquire(&distinct))
+            std::pin::pin!(broker.acquire(&distinct, 0))
                 .as_mut()
                 .poll(&mut cx)
                 .is_ready()
@@ -308,7 +313,7 @@ mod tests {
 
         // A repeated token is acquired once, so the acquire completes on the first poll.
         let repeated = requirements(&["a", "b", "a"]);
-        let guard = match std::pin::pin!(broker.acquire(&repeated))
+        let guard = match std::pin::pin!(broker.acquire(&repeated, 0))
             .as_mut()
             .poll(&mut cx)
         {
@@ -318,7 +323,7 @@ mod tests {
 
         // The token is held exactly once: another acquire waits until the guard is dropped.
         let other = requirements(&["a"]);
-        let mut other_acquire = std::pin::pin!(broker.acquire(&other));
+        let mut other_acquire = std::pin::pin!(broker.acquire(&other, 0));
         assert!(other_acquire.as_mut().poll(&mut cx).is_pending());
         drop(guard);
         assert!(other_acquire.as_mut().poll(&mut cx).is_ready());
@@ -363,5 +368,35 @@ mod tests {
                 .into_count(),
             10,
         );
+    }
+
+    #[test]
+    fn test_priority_with_oversized_weight_and_exclusive_access() {
+        use std::task::Context;
+        use std::task::Poll;
+        use std::task::Waker;
+
+        let broker = HostSharingBroker::new(HostSharingStrategy::Fifo, 2);
+        let mut cx = Context::from_waker(Waker::noop());
+        let one = HostSharingRequirements::Shared(WeightClass::Permits(1));
+        let heavy = HostSharingRequirements::Shared(WeightClass::Permits(8));
+        let exclusive = HostSharingRequirements::ExclusiveAccess;
+        let active = match std::pin::pin!(broker.acquire(&one, 0)).as_mut().poll(&mut cx) {
+            Poll::Ready(guard) => guard,
+            Poll::Pending => panic!("uncontended work must run"),
+        };
+        let mut queued = Box::pin(broker.acquire(&exclusive, 0));
+        let mut critical = Box::pin(broker.acquire(&heavy, 1));
+        assert!(queued.as_mut().poll(&mut cx).is_pending());
+        assert!(critical.as_mut().poll(&mut cx).is_pending());
+        drop(active);
+        assert!(queued.as_mut().poll(&mut cx).is_pending());
+        let critical = match critical.as_mut().poll(&mut cx) {
+            Poll::Ready(guard) => guard,
+            Poll::Pending => panic!("oversized weight must be capped and admitted first"),
+        };
+        assert!(queued.as_mut().poll(&mut cx).is_pending());
+        drop(critical);
+        assert!(queued.as_mut().poll(&mut cx).is_ready());
     }
 }

@@ -134,6 +134,9 @@ pub(crate) fn analysis_actions_methods_run(methods: &mut MethodsBuilder) {
     ///   event stream, and must be unique for a given target
     /// * `weight`: used to note how heavy the command is and will typically be set to a higher
     ///   value to indicate that less such commands should be run in parallel (if running locally)
+    /// * `priority`: local admission priority (signed integer, default 0). Higher
+    ///   values run before queued lower-priority actions without preempting work
+    ///   or changing resource `weight`. This does not affect action cache keys.
     /// * `no_outputs_cleanup`: if this flag is set then Buck2 won't clean the outputs of a previous
     ///   build that might be present on a disk; in which case, command from arguments should be
     ///   responsible for the cleanup (that is useful, for example, when an action is supporting
@@ -267,6 +270,7 @@ pub(crate) fn analysis_actions_methods_run(methods: &mut MethodsBuilder) {
         #[starlark(require = named, default = false)] always_print_stderr: bool,
         #[starlark(require = named)] weight: Option<u32>,
         #[starlark(require = named)] weight_percentage: Option<u32>,
+        #[starlark(require = named, default = 0)] priority: i32,
         #[starlark(require = named)] dep_files: Option<SmallMap<&'v str, &'v ArtifactTag>>,
         #[starlark(require = named, default = UnpackListOrTuple::default())]
         dep_file_fingerprints: UnpackListOrTuple<ValueTyped<'v, StarlarkDepFileFingerprint<'v>>>,
@@ -624,6 +628,7 @@ pub(crate) fn analysis_actions_methods_run(methods: &mut MethodsBuilder) {
             executor_preference,
             always_print_stderr,
             weight,
+            priority,
             low_pass_filter,
             dep_files: dep_files_configuration,
             metadata_param,

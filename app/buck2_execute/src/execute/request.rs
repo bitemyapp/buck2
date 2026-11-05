@@ -373,6 +373,8 @@ pub struct CommandExecutionRequest {
     timeout: Option<Duration>,
     pub executor_preference: ExecutorPreference,
     host_sharing_requirements: Arc<HostSharingRequirements>,
+    /// Local admission order only; never serialized into the remote action.
+    priority: i32,
     // Used to disable the low pass filter for concurrent local actions. Enabled by default
     low_pass_filter: bool,
     /// Working directory, relative to the project root.
@@ -447,6 +449,7 @@ impl CommandExecutionRequest {
             timeout: None,
             executor_preference: ExecutorPreference::Default,
             host_sharing_requirements: Arc::new(HostSharingRequirements::default()),
+            priority: 0,
             low_pass_filter: true,
             working_directory: ProjectRelativePathBuf::default(),
             prefetch_lossy_stderr: false,
@@ -509,6 +512,11 @@ impl CommandExecutionRequest {
         host_sharing_requirements: Arc<HostSharingRequirements>,
     ) -> Self {
         self.host_sharing_requirements = host_sharing_requirements;
+        self
+    }
+
+    pub fn with_priority(mut self, priority: i32) -> Self {
+        self.priority = priority;
         self
     }
 
@@ -609,6 +617,10 @@ impl CommandExecutionRequest {
 
     pub fn host_sharing_requirements(&self) -> &HostSharingRequirements {
         &self.host_sharing_requirements
+    }
+
+    pub fn priority(&self) -> i32 {
+        self.priority
     }
 
     pub fn low_pass_filter(&self) -> bool {
