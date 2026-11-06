@@ -13,19 +13,22 @@
 //! A process-shared lock protects the SQLite LRU and object namespace. The
 //! database is an eviction index, not an authority for content correctness.
 //!
-//! Artifact ingestion holds both locks for one bounded group at a time. Groups
-//! contain at most 16 destinations and target 64 MiB of staged logical bytes;
-//! one larger file is admitted alone, provided it fits the configured cache.
-//! At most two retained file descriptors per destination are needed. All COW
-//! snapshots are verified before the separate per-file sync pass. FULL SQLite
+//! Artifact ingestion holds both locks for a bounded metadata quantum: at most
+//! 256 destinations or 256 MiB charged as two snapshots per destination. Each
+//! staging group contains at most 16 destinations and targets 64 MiB of staged
+//! logical bytes. A file larger than either budget runs alone at that level,
+//! provided it fits the cache. At most 32 stage/source descriptors are retained.
+//! All COW snapshots are verified before the per-file sync pass. FULL SQLite
 //! accounting commits precede canonical renames, and namespace removals are
 //! directory-synced before deletion accounting commits. Publication directory
-//! syncs and the access/weak-view transaction are shared within each group.
+//! syncs are shared within staging groups; cached-only groups share metadata
+//! commits until the quantum ends. Transactions finish before either unlock.
 //! Before admission, each group clears a fixed staging namespace under both
 //! locks, including leftovers from a dead peer whose survivors remain open.
 //! Staging stays directly beside canonical objects, not across a subvolume.
 
 const INGEST_BATCH_FILES: usize = 16;
+const INGEST_METADATA_FILES: usize = 256;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -62,6 +65,7 @@ mod linux {
     use tempfile::NamedTempFile;
 
     const INGEST_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+    const INGEST_METADATA_BYTES: u64 = 256 * 1024 * 1024;
 
     // Materialization already runs on Tokio's blocking pool while holding store
     // locks. Never submit nested blocking work there: a saturated pool could
@@ -185,6 +189,7 @@ mod linux {
     struct GroupResult {
         consumed: usize,
         found: bool,
+        staging_bytes: u64,
     }
 
     pub(super) struct Store {
@@ -525,11 +530,55 @@ mod linux {
             }
         }
 
+        // Keep both store locks until metadata commits. Cached-only groups can
+        // share a transaction, but new accounting commits before publication
+        // and ends the quantum. Bound lock ownership independently of the
+        // smaller live staging/descriptor budget.
         fn access_group<'a>(
             &self,
+            files: impl Iterator<Item = (&'a Path, &'a FileDigest, bool)> + Clone,
+            config: DigestConfig,
+            ingest: bool,
+        ) -> buck2_error::Result<GroupResult> {
+            let mut files = files.peekable();
+            let mut transaction = None;
+            let mut result = GroupResult { consumed: 0, found: true, staging_bytes: 0 };
+            while result.consumed < super::INGEST_METADATA_FILES {
+                let Some((_, digest, _)) = files.peek() else {
+                    break;
+                };
+                let remaining_bytes = INGEST_METADATA_BYTES.saturating_sub(result.staging_bytes);
+                if result.consumed != 0 && digest.size().saturating_mul(2) > remaining_bytes {
+                    break;
+                }
+                let group = self.stage_group(
+                    files.clone().take(super::INGEST_METADATA_FILES - result.consumed),
+                    config,
+                    ingest,
+                    remaining_bytes,
+                    &mut transaction,
+                )?;
+                files.nth(group.consumed - 1);
+                result.consumed += group.consumed;
+                result.found &= group.found;
+                result.staging_bytes = result.staging_bytes.saturating_add(group.staging_bytes);
+                if transaction.is_none() || result.staging_bytes >= INGEST_METADATA_BYTES {
+                    break;
+                }
+            }
+            if let Some(transaction) = transaction {
+                transaction.commit()?;
+            }
+            Ok(result)
+        }
+
+        fn stage_group<'a, 'store>(
+            &'store self,
             files: impl Iterator<Item = (&'a Path, &'a FileDigest, bool)>,
             config: DigestConfig,
             ingest: bool,
+            byte_budget: u64,
+            transaction: &mut Option<rusqlite::Transaction<'store>>,
         ) -> buck2_error::Result<GroupResult> {
             let capacity = files.size_hint().1
                 .unwrap_or(super::INGEST_BATCH_FILES)
@@ -540,7 +589,8 @@ mod linux {
             let mut staged_bytes = 0u64;
             // Recovery stages both a canonical object and its first view.
             // Reserve that worst case rather than exceeding the staging budget.
-            let byte_limit = self.max_bytes.saturating_mul(2).min(INGEST_BATCH_BYTES);
+            let byte_limit = self.max_bytes.saturating_mul(2)
+                .min(INGEST_BATCH_BYTES).min(byte_budget);
             for (destination, digest, executable) in files.take(super::INGEST_BATCH_FILES) {
                 if digest.size() > self.max_bytes {
                     return Err(error(format!(
@@ -588,11 +638,13 @@ mod linux {
                 }
             }
             if requests.is_empty() {
-                return Ok(GroupResult { consumed: 0, found: true });
+                return Ok(GroupResult { consumed: 0, found: true, staging_bytes: 0 });
             }
             self.clear_staging()?;
 
-            let transaction = self.db.unchecked_transaction()?;
+            if transaction.is_none() {
+                *transaction = Some(self.db.unchecked_transaction()?);
+            }
             let mut removed_names = false;
             for object in &mut objects {
                 let recorded: bool = self.db.query_row(
@@ -634,8 +686,10 @@ mod linux {
                         if removed_names {
                             File::open(&self.root)?.sync_all()?;
                         }
-                        transaction.commit()?;
-                        return Ok(GroupResult { consumed: requests.len(), found: false });
+                        transaction.take().expect("active group transaction").commit()?;
+                        return Ok(GroupResult {
+                            consumed: requests.len(), found: false, staging_bytes: staged_bytes,
+                        });
                     }
                 });
             }
@@ -705,7 +759,7 @@ mod linux {
                                 // No new accounting or canonical renames have
                                 // occurred. Commit only removals/hint cleanup.
                                 File::open(&self.root)?.sync_all()?;
-                                transaction.commit()?;
+                                transaction.take().expect("active group transaction").commit()?;
                             }
                         }
                         return Err(error);
@@ -745,9 +799,17 @@ mod linux {
                     params![object.key, object.digest.size()],
                 )?;
             }
-            // FULL accounting is durable BEFORE any canonical rename. Failure
-            // can leave accounted misses; it cannot publish unaccounted objects.
-            transaction.commit()?;
+            // Weak paths are advisory and reverified on use; they may precede
+            // publication. Recording accesses now lets subsequent groups see
+            // the right eviction order without a second durable transaction.
+            for request in &requests {
+                self.record_access(request.destination, &objects[request.object].key)?;
+            }
+            if new_entries != 0 || removed_names {
+                // FULL accounting is durable BEFORE any canonical rename.
+                // Failure can leave accounted misses, never unaccounted objects.
+                transaction.take().expect("active group transaction").commit()?;
+            }
             for object in &mut objects {
                 if let Some(staged) = object.staged.take() {
                     staged.persist(&object.path).map_err(|error| error.error)?;
@@ -766,12 +828,9 @@ mod linux {
             for parent in parents {
                 File::open(parent)?.sync_all()?;
             }
-            let transaction = self.db.unchecked_transaction()?;
-            for request in &requests {
-                self.record_access(request.destination, &objects[request.object].key)?;
-            }
-            transaction.commit()?;
-            Ok(GroupResult { consumed: requests.len(), found: true })
+            Ok(GroupResult {
+                consumed: requests.len(), found: true, staging_bytes: staged_bytes,
+            })
         }
 
         fn access(
@@ -863,8 +922,8 @@ mod linux {
     ) -> buck2_error::Result<()> {
         let mut offset = 0;
         while offset < files.len() {
-            // Byte/entry limits may split the outer descriptor-bounded batch.
-            // Release BOTH locks between those groups, not just between artifacts.
+            // Release both locks at metadata-quanta boundaries, including
+            // earlier boundaries required by new canonical accounting.
             offset += with_store(files.len() - offset, |store| {
                 let group = store.access_group(
                     files[offset..].iter().map(|(path, metadata)| {
@@ -996,7 +1055,7 @@ mod linux {
                         }), config, true,
                     )?;
                     assert!(group.found);
-                    assert!(group.consumed > 0 && group.consumed <= super::super::INGEST_BATCH_FILES);
+                    assert!(group.consumed > 0);
                     assert_bounded_and_accounted(store)?;
                     Ok::<_, buck2_error::Error>(group)
                 })();
@@ -1005,6 +1064,78 @@ mod linux {
                 unlock?;
                 offset += group.consumed;
             }
+            Ok(())
+        }
+
+        #[test]
+        fn reflink_store_metadata_batch_lru_and_rollback() -> buck2_error::Result<()> {
+            let temp = tempfile::tempdir()?;
+            let config = DigestConfig::leak_new(vec![DigestAlgorithm::Sha256], None)?;
+            let store = Store::open(temp.path().join("store"), 2 * 4096, 2)?;
+            let a_bytes = vec![1; 4096];
+            let a_digest = FileDigest::from_content(&a_bytes, config.cas_digest_config());
+            let original = temp.path().join("original");
+            fs::write(&original, &a_bytes)?;
+            assert!(store.access(&original, &a_digest, false, config, true)?);
+            let b_bytes = vec![2; 4096];
+            let b_digest = FileDigest::from_content(&b_bytes, config.cas_digest_config());
+            let older = temp.path().join("older");
+            fs::write(&older, &b_bytes)?;
+            assert!(store.access(&older, &b_digest, false, config, true)?);
+
+            // Cached accesses span several staging groups. Their uncommitted
+            // LRU updates must protect A, not B, when a later group admits C.
+            let mut files = Vec::new();
+            for index in 0..32 {
+                let path = temp.path().join(format!("warm-{index}"));
+                fs::write(&path, &a_bytes)?;
+                files.push((path, a_digest.clone(), false));
+            }
+            let c_bytes = vec![3; 4096];
+            let c_digest = FileDigest::from_content(&c_bytes, config.cas_digest_config());
+            let newest = temp.path().join("newest");
+            fs::write(&newest, &c_bytes)?;
+            files.push((newest, c_digest.clone(), false));
+            ingest_groups(&store, &files, config)?;
+            assert!(store.root.join(Store::key(&a_digest)).exists());
+            assert!(!store.root.join(Store::key(&b_digest)).exists());
+            assert!(store.root.join(Store::key(&c_digest)).exists());
+
+            // A committed weak view must survive eviction and loss of its
+            // original source, including through a separate store connection.
+            store.evict(4096, 1)?;
+            fs::remove_file(original)?;
+            let peer = Store::open(store.root.clone(), 2 * 4096, 2)?;
+            let recovered = temp.path().join("recovered");
+            assert!(peer.access(&recovered, &a_digest, false, config, false)?);
+            assert_eq!(fs::read(&recovered)?, a_bytes);
+            drop(peer);
+
+            // Fail publication after earlier cached groups succeeded. Their
+            // advisory updates roll back before the lock is released; already
+            // published verified bytes and canonical accounting stay valid.
+            files.clear();
+            for index in 0..32 {
+                let path = temp.path().join(format!("rollback-{index}"));
+                fs::write(&path, &a_bytes)?;
+                files.push((path, a_digest.clone(), false));
+            }
+            let bad = temp.path().join("directory");
+            fs::create_dir(&bad)?;
+            fs::write(bad.join("keep"), b"untouched")?;
+            files.push((bad.clone(), a_digest.clone(), false));
+            assert!(ingest_groups(&store, &files, config).is_err());
+            assert_eq!(fs::read(&files[0].0)?, a_bytes);
+            assert_eq!(fs::read(bad.join("keep"))?, b"untouched");
+            let hinted: bool = store.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM views WHERE path=?1)",
+                [bad.to_str().expect("temporary UTF-8 path")], |row| row.get(0),
+            )?;
+            assert!(!hinted);
+            assert_bounded_and_accounted(&store)?;
+            let after_error = temp.path().join("after-error");
+            assert!(store.access(&after_error, &a_digest, false, config, false)?);
+            assert_eq!(fs::read(after_error)?, a_bytes);
             Ok(())
         }
 
@@ -1645,11 +1776,11 @@ pub(crate) fn artifact<D: ActionDirectory>(
         return Ok(());
     }
     let mut walk = unordered_entry_walk(entry.as_ref().map_dir(Directory::as_ref));
-    let mut files = Vec::with_capacity(INGEST_BATCH_FILES);
+    let mut files = Vec::with_capacity(INGEST_METADATA_FILES);
     while let Some((relative, entry)) = walk.next() {
         if let DirectoryEntry::Leaf(ActionDirectoryMember::File(metadata)) = entry {
             files.push((path.join(relative.get()), metadata.dupe()));
-            if files.len() == INGEST_BATCH_FILES {
+            if files.len() == INGEST_METADATA_FILES {
                 ingest_files(&files, config)?;
                 files.clear();
             }
