@@ -124,6 +124,15 @@ weak-view updates share one durable SQLite transaction. Object accounting still
 commits before canonical publication, with file and directory synchronization
 preserved.
 
+Tree ingestion clones, verifies and synchronizes bounded groups on a dedicated
+16-thread pool; singleton work stays inline. Workers join before accounting,
+publication or cleanup. Cached groups share a metadata quantum of at most 256
+destinations or 256 MiB charged as two snapshots per destination; an oversized
+individual object runs alone and must fit the store's limits. View renames share
+one directory barrier per parent per quantum, completed before successful return.
+Canonical publication retains its own accounting and directory barriers. Both
+store locks remain held; this is not concurrent SQLite or deferred durability.
+
 Local producers can prepare private output snapshots concurrently with execution.
 Linux close-write/move events are advisory; only final output validation and
 content hashes authorize reuse or successful action-cache publication. Four

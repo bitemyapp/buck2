@@ -57,6 +57,8 @@ mod linux {
     use buck2_error::BuckErrorContext;
     use buck2_execute::digest_config::DigestConfig;
     use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
+    use rayon::iter::IndexedParallelIterator;
+    use rayon::iter::IntoParallelRefMutIterator;
     use rayon::iter::IntoParallelRefIterator;
     use rayon::iter::ParallelIterator;
     use rusqlite::Connection;
@@ -72,8 +74,9 @@ mod linux {
 
     // Materialization already runs on Tokio's blocking pool while holding store
     // locks. Never submit nested blocking work there: a saturated pool could
-    // deadlock. These dedicated workers only synchronize borrowed file handles.
-    static FILE_SYNCS: LazyLock<Result<rayon::ThreadPool, String>> = LazyLock::new(|| {
+    // deadlock. These dedicated workers clone, verify and synchronize bounded
+    // batches; all work joins before accounting or publication can proceed.
+    static FILE_IO: LazyLock<Result<rayon::ThreadPool, String>> = LazyLock::new(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(super::INGEST_BATCH_FILES)
             .spawn_handler(|thread| {
@@ -469,7 +472,6 @@ mod linux {
         }
 
         fn stage_publication(
-            &self,
             source: &File,
             destination: &Path,
             digest: &FileDigest,
@@ -547,7 +549,7 @@ mod linux {
                 // changed its output or replaced it with a symlink.
                 if path.is_absolute() {
                     if let Ok(mut source) = open_file(path) {
-                        match self.stage_publication(&source, destination, digest, executable, config) {
+                        match Self::stage_publication(&source, destination, digest, executable, config) {
                             Ok(staged) => return Ok(Some(staged)),
                             Err(error) => {
                                 // A valid candidate must not hide destination I/O
@@ -576,6 +578,12 @@ mod linux {
             let mut files = files.peekable();
             let mut transaction = None;
             let mut result = GroupResult { consumed: 0, found: true, staging_bytes: 0 };
+            let mut parents = HashSet::new();
+            if files.peek().is_some() {
+                // No peer can create staging files while this quantum owns
+                // both locks; completed groups remove all their own stages.
+                self.clear_staging()?;
+            }
             while result.consumed < super::INGEST_METADATA_FILES {
                 let Some((_, digest, _)) = files.peek() else {
                     break;
@@ -590,6 +598,7 @@ mod linux {
                     ingest,
                     remaining_bytes,
                     &mut transaction,
+                    &mut parents,
                 )?;
                 files.nth(group.consumed - 1);
                 result.consumed += group.consumed;
@@ -598,6 +607,12 @@ mod linux {
                 if transaction.is_none() || result.staging_bytes >= INGEST_METADATA_BYTES {
                     break;
                 }
+            }
+            // Cached groups often publish into the same incremental-session
+            // directories. One barrier per parent per bounded quantum suffices;
+            // no successful result escapes before every rename is durable.
+            for parent in parents {
+                File::open(parent)?.sync_all()?;
             }
             if let Some(transaction) = transaction {
                 transaction.commit()?;
@@ -612,6 +627,7 @@ mod linux {
             ingest: bool,
             byte_budget: u64,
             transaction: &mut Option<rusqlite::Transaction<'store>>,
+            parents: &mut HashSet<&'a Path>,
         ) -> buck2_error::Result<GroupResult> {
             let capacity = files.size_hint().1
                 .unwrap_or(super::INGEST_BATCH_FILES)
@@ -673,7 +689,6 @@ mod linux {
             if requests.is_empty() {
                 return Ok(GroupResult { consumed: 0, found: true, staging_bytes: 0 });
             }
-            self.clear_staging()?;
 
             if transaction.is_none() {
                 *transaction = Some(self.db.unchecked_transaction()?);
@@ -741,65 +756,97 @@ mod linux {
             // those temporary CAS bytes/entries fit alongside remaining objects.
             // A recovered view is beside its destination, not inside the CAS.
             for (slot, object) in objects.iter_mut().filter(|object| object.new).enumerate() {
-                let source = object.source.take().expect("group source prepared");
-                let mut staged = self.stage_canonical(slot)?;
-                match &source {
+                object.staged = Some(self.stage_canonical(slot)?);
+            }
+            let prepare_canonical = |object: &mut IngestObject<'_>| -> buck2_error::Result<()> {
+                let staged = object.staged.as_mut().expect("canonical stage allocated");
+                match object.source.as_ref().expect("group source prepared") {
                     IngestSource::Produced(file) => clone_file(file, staged.as_file())?,
                     IngestSource::Recovered(file) => clone_file(file.as_file(), staged.as_file())?,
                     IngestSource::Canonical(_) => unreachable!("new canonical object"),
                 }
                 verify(staged.as_file_mut(), object.digest, config)?;
                 staged.as_file().set_permissions(Permissions::from_mode(0o444))?;
-                object.staged = Some(staged);
-                if let IngestSource::Recovered(file) = source {
+                Ok(())
+            };
+            if new_entries > 1 {
+                FILE_IO.as_ref().map_err(error)?.install(|| {
+                    objects.par_iter_mut().filter(|object| object.new)
+                        .try_for_each(prepare_canonical)
+                })?;
+            } else {
+                objects.iter_mut().filter(|object| object.new)
+                    .try_for_each(prepare_canonical)?;
+            }
+            for object in objects.iter_mut().filter(|object| object.new) {
+                if let Some(IngestSource::Recovered(file)) = object.source.take() {
                     publications.push(Publication {
                         file: PublicationFile::Staged(file),
                         destination: requests[object.first_request].destination,
                     });
                 }
             }
-            for (index, request) in requests.iter().enumerate() {
-                let object = &mut objects[request.object];
+            let prepare_publication = |(index, request): (usize, &IngestRequest<'a>)|
+                -> buck2_error::Result<Option<Publication<'a>>> {
+                let object = &objects[request.object];
                 if object.new && index == object.first_request {
                     // The original produced file already shares the new COW
                     // object's extents and retains its existing executable mode.
-                    continue;
+                    return Ok(None);
                 }
                 if ingest {
                     if let Some(file) = prepared_outputs::take(
                         request.destination, object.digest, request.executable,
                     )? {
-                        // Remove only the consumed private hint. The verified
-                        // final digest, not a timestamp, authorizes this view.
-                        self.db.execute(
-                            "DELETE FROM views WHERE path=?1",
-                            [file.path.to_str().ok_or_else(|| error("Non-UTF-8 prepared path"))?],
-                        )?;
-                        publications.push(Publication {
+                        return Ok(Some(Publication {
                             file: PublicationFile::Prepared(file),
                             destination: request.destination,
-                        });
-                        continue;
+                        }));
                     }
                 }
-                let publication = {
-                    let source = if let Some(staged) = &object.staged {
-                        staged.as_file()
-                    } else {
-                        match object.source.as_ref().expect("canonical source prepared") {
-                            IngestSource::Canonical(file) => file,
-                            _ => unreachable!("existing canonical object"),
-                        }
-                    };
-                    self.stage_publication(
-                        source, request.destination, object.digest, request.executable, config,
-                    )
+                let source = if let Some(staged) = &object.staged {
+                    staged.as_file()
+                } else {
+                    match object.source.as_ref().expect("canonical source prepared") {
+                        IngestSource::Canonical(file) => file,
+                        _ => unreachable!("existing canonical object"),
+                    }
                 };
+                Self::stage_publication(
+                    source, request.destination, object.digest, request.executable, config,
+                ).map(|file| Some(Publication {
+                    file: PublicationFile::Staged(file),
+                    destination: request.destination,
+                }))
+            };
+            // Keep ordered results until every worker has joined. Errors cannot
+            // remove a canonical source while another snapshot still reads it.
+            let mut single = None;
+            let staged: Vec<_> = if new_entries == requests.len() as u64 {
+                Vec::new()
+            } else if requests.len() > 1 {
+                FILE_IO.as_ref().map_err(error)?.install(|| {
+                    requests.par_iter().enumerate().map(prepare_publication).collect()
+                })
+            } else {
+                single = Some(prepare_publication((0, &requests[0])));
+                Vec::new()
+            };
+            for (request, publication) in requests.iter().zip(single.into_iter().chain(staged)) {
+                let object = &mut objects[request.object];
                 match publication {
-                    Ok(file) => publications.push(Publication {
-                        file: PublicationFile::Staged(file),
-                        destination: request.destination,
-                    }),
+                    Ok(None) => {}
+                    Ok(Some(publication)) => {
+                        if let PublicationFile::Prepared(file) = &publication.file {
+                            // Remove only the consumed private hint. Final
+                            // digests, not timestamps, authorize prepared views.
+                            self.db.execute(
+                                "DELETE FROM views WHERE path=?1",
+                                [file.path.to_str().ok_or_else(|| error("Non-UTF-8 prepared path"))?],
+                            )?;
+                        }
+                        publications.push(publication);
+                    }
                     Err(error) => {
                         // Destination I/O/reflink errors are not corruption.
                         if let Some(IngestSource::Canonical(source)) = object.source.as_mut() {
@@ -830,7 +877,7 @@ mod linux {
                         // Singleton downloads and files do not start a pool.
                         first.as_file().sync_all()?;
                     } else {
-                        FILE_SYNCS.as_ref().map_err(error)?.install(|| {
+                        FILE_IO.as_ref().map_err(error)?.install(|| {
                             objects
                                 .par_iter()
                                 .filter_map(|object| object.staged.as_ref())
@@ -868,15 +915,11 @@ mod linux {
             if new_entries != 0 {
                 File::open(&self.root)?.sync_all()?;
             }
-            let mut parents = HashSet::with_capacity(publications.len());
             for publication in publications {
                 let parent = publication.destination.parent()
                     .ok_or_else(|| error("Missing output parent"))?;
                 publication.file.persist(publication.destination)?;
                 parents.insert(parent);
-            }
-            for parent in parents {
-                File::open(parent)?.sync_all()?;
             }
             Ok(GroupResult {
                 consumed: requests.len(), found: true, staging_bytes: staged_bytes,
