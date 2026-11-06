@@ -15,6 +15,10 @@ use buck2_core::cells::cell_path::CellPath;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_hash::BuckMutSet;
 
+use crate::legacy_configs::telemetry::ConfigArgvRedactor;
+use crate::legacy_configs::telemetry::config_argument_redaction_span;
+use crate::legacy_configs::telemetry::redact_config_argument;
+
 /// Argv contains the bare process argv and the "expanded" argv. The expanded argv is
 /// the argv after processing flagfiles (args like @mode/opt and --flagfile mode/opt)
 /// and after possibly replacing `argv[0]` with a more representative value.
@@ -22,6 +26,29 @@ use buck2_hash::BuckMutSet;
 pub struct Argv {
     pub argv: Vec<String>,
     pub expanded_argv: ExpandedArgv,
+    config_redactions: Vec<(usize, usize)>,
+    expanded_config_redactions: Vec<(usize, usize)>,
+}
+
+/// Logging-only spans captured by the real CLI value parsers, including values
+/// subsequently overwritten by global-option merging. Never stores values.
+#[derive(Default)]
+pub struct ConfigArgvRedactions {
+    raw: Vec<(usize, usize)>,
+    expanded: Vec<(usize, usize)>,
+}
+
+impl ConfigArgvRedactions {
+    pub fn record(&mut self, argv: &[String], expanded: &ExpandedArgv, value: &str) {
+        self.raw.extend(argv.iter().enumerate().filter_map(|(index, arg)| {
+            config_argument_redaction_span(arg, value).map(|start| (index, start))
+        }));
+        self.expanded.extend(
+            expanded.args().enumerate().filter_map(|(index, arg)| {
+                config_argument_redaction_span(arg, value).map(|start| (index, start))
+            }),
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -81,14 +108,18 @@ impl ExpandedArgv {
         }
     }
 
-    fn redacted(self, to_redact: &BuckMutSet<&String>) -> ExpandedArgv {
-        Self {
-            args: self
-                .args
-                .into_iter()
-                .filter(|(arg, _)| !to_redact.contains(arg))
-                .collect(),
-        }
+    fn redacted(
+        mut self,
+        to_redact: &BuckMutSet<&String>,
+        config_redactions: &[(usize, usize)],
+    ) -> ExpandedArgv {
+        let mut redactor = ConfigArgvRedactor::new(config_redactions);
+        self.args.retain_mut(|(arg, _)| {
+            let keep = !to_redact.contains(arg);
+            redactor.redact(arg);
+            keep
+        });
+        self
     }
 
     pub fn args(&self) -> impl Iterator<Item = &str> {
@@ -285,7 +316,10 @@ pub fn get_representative_config_flags(expanded_argv: &ExpandedArgv) -> Vec<Stri
             }
             None => {
                 let formatted = match flag_value {
-                    ConfigFlagValue::ConfigFlag(v) => format!("-c {v}"),
+                    ConfigFlagValue::ConfigFlag(mut v) => {
+                        redact_config_argument(&mut v);
+                        format!("-c {v}")
+                    }
                     ConfigFlagValue::ConfigFile(v) => format!("--config-file {v}"),
                     ConfigFlagValue::Modifier(v) => format!("-m {v}"),
                     ConfigFlagValue::TargetPlatforms(v) => format!("--target-platforms {v}"),
@@ -303,6 +337,8 @@ pub fn get_representative_config_flags(expanded_argv: &ExpandedArgv) -> Vec<Stri
 /// The "sanitized" argv is the argv and expanded argv after stripping some possibly sensitive
 /// arguments. What's considered sensitive is command-specific and usually determined by an implementation
 /// of `StreamingCommand::sanitize_argv`.
+/// All config values are always redacted in both argv forms,
+/// independently of additional command-specific argument removal.
 ///
 /// For example, for the run command this will strip out the arguments passed to the executed command (i.e. those after `--`).
 #[derive(Clone)]
@@ -314,26 +350,43 @@ pub struct SanitizedArgv {
 }
 
 impl Argv {
-    pub fn no_need_to_sanitize(self) -> SanitizedArgv {
-        let Argv {
+    /// Arguments remain operational; only their logging projections use the
+    /// spans recorded by the real CLI value parsers.
+    pub fn new(
+        argv: Vec<String>,
+        expanded_argv: ExpandedArgv,
+        mut redactions: ConfigArgvRedactions,
+    ) -> Self {
+        // Global Clap options can occur in several match scopes. If different
+        // classified values overlap, retain only the earliest redaction start.
+        for spans in [&mut redactions.raw, &mut redactions.expanded] {
+            spans.sort_unstable();
+            spans.dedup_by_key(|(index, _)| *index);
+        }
+        Self {
             argv,
             expanded_argv,
-        } = self;
-        SanitizedArgv {
-            argv,
-            expanded_argv,
-            _priv: (),
+            config_redactions: redactions.raw,
+            expanded_config_redactions: redactions.expanded,
         }
     }
 
-    pub fn redacted(self, to_redact: BuckMutSet<&String>) -> SanitizedArgv {
+    pub fn no_need_to_sanitize(self) -> SanitizedArgv {
+        self.redacted(BuckMutSet::default())
+    }
+
+    pub fn redacted(mut self, to_redact: BuckMutSet<&String>) -> SanitizedArgv {
+        let mut redactor = ConfigArgvRedactor::new(&self.config_redactions);
+        self.argv.retain_mut(|arg| {
+            let keep = !to_redact.contains(arg);
+            redactor.redact(arg);
+            keep
+        });
         SanitizedArgv {
-            argv: self
-                .argv
-                .into_iter()
-                .filter(|arg| !to_redact.contains(arg))
-                .collect(),
-            expanded_argv: self.expanded_argv.redacted(&to_redact),
+            argv: self.argv,
+            expanded_argv: self
+                .expanded_argv
+                .redacted(&to_redact, &self.expanded_config_redactions),
             _priv: (),
         }
     }
@@ -346,6 +399,132 @@ mod tests {
     use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
 
     use super::*;
+
+    fn classified_argv<'a>(
+        argv: Vec<String>,
+        expanded: ExpandedArgv,
+        values: impl Iterator<Item = &'a str>,
+    ) -> Argv {
+        let mut redactions = ConfigArgvRedactions::default();
+        for value in values {
+            redactions.record(&argv, &expanded, value);
+        }
+        Argv::new(argv, expanded, redactions)
+    }
+
+    #[test]
+    fn malformed_config_logging_argv_does_not_echo_private_values() {
+        for (args, value) in [
+            (vec!["--config", "synthetic-malformed-credential"], "synthetic-malformed-credential"),
+            (vec!["-c", "key=synthetic-malformed-credential"], "key=synthetic-malformed-credential"),
+            (vec!["--config=buck2_re_client.=synthetic-malformed-credential"], "buck2_re_client.=synthetic-malformed-credential"),
+            (vec!["-c", "synthetic-malformed-credential=="], "synthetic-malformed-credential=="),
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            let input = classified_argv(
+                args.clone(),
+                ExpandedArgv::from_literals(args),
+                std::iter::once(value),
+            );
+            let sanitized = input.clone().no_need_to_sanitize();
+            assert!(!sanitized.argv.join(" ").contains("synthetic-malformed-credential"));
+            assert!(!sanitized.expanded_argv.args().collect::<Vec<_>>().join(" ").contains("synthetic-malformed-credential"));
+            assert!(!get_representative_config_flags(&input.expanded_argv).join(" ").contains("synthetic-malformed-credential"));
+        }
+    }
+
+    #[test]
+    fn config_credentials_are_redacted_from_all_logging_argv_forms() {
+        let secret = "synthetic-argv-credential";
+        let assignment = format!("other//ordinary.choice={secret}");
+        for args in [
+            vec!["-c".to_owned(), assignment.clone()],
+            vec!["--config".to_owned(), assignment.clone()],
+            vec![format!("-c{assignment}")],
+            vec![format!("-c={assignment}")],
+            vec![format!("--config={assignment}")],
+        ] {
+            let input = classified_argv(
+                args.clone(),
+                ExpandedArgv::from_literals(args),
+                std::iter::once(assignment.as_str()),
+            );
+            let sanitized = input.clone().no_need_to_sanitize();
+            assert!(input.argv.join(" ").contains(secret));
+            assert!(input.expanded_argv.args().collect::<Vec<_>>().join(" ").contains(secret));
+            assert!(!sanitized.argv.join(" ").contains(secret));
+            assert!(!sanitized.expanded_argv.args().collect::<Vec<_>>().join(" ").contains(secret));
+            assert_eq!(
+                get_representative_config_flags(&input.expanded_argv),
+                vec!["-c other//ordinary.choice=<redacted>"],
+            );
+        }
+
+        let mut expanded = ExpandedArgvBuilder::new();
+        expanded.argfile_scope(ArgFileKind::Stdin, |args| {
+            args.push("--config".to_owned());
+            args.push(assignment.clone());
+            args.push("-cbuild.threads=8".to_owned());
+        });
+        let input = classified_argv(
+            vec!["@-".to_owned()],
+            expanded.build(),
+            [assignment.as_str(), "build.threads=8"].into_iter(),
+        );
+        let sanitized = input.clone().no_need_to_sanitize();
+        assert_eq!(sanitized.argv, vec!["@-"]);
+        assert!(!sanitized.expanded_argv.args().collect::<Vec<_>>().join(" ").contains(secret));
+        assert!(matches!(sanitized.expanded_argv.iter().next().unwrap().1, ExpandedArgSource::Flagfile(_)));
+        assert_eq!(
+            get_representative_config_flags(&input.expanded_argv),
+            vec!["-c other//ordinary.choice=<redacted>", "-c build.threads=<redacted>"],
+        );
+    }
+
+    #[test]
+    fn settings_values_follow_the_same_argv_privacy_policy() {
+        for args in [
+            vec!["--setting", "ordinary.choice=synthetic-setting-credential"],
+            vec!["--setting=ordinary.choice=synthetic-setting-credential"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            let input = classified_argv(
+                args.clone(),
+                ExpandedArgv::from_literals(args),
+                std::iter::once("ordinary.choice=synthetic-setting-credential"),
+            );
+            let sanitized = input.no_need_to_sanitize();
+            assert!(!sanitized.argv.join(" ").contains("synthetic-setting-credential"));
+            assert!(sanitized.argv.join(" ").contains("ordinary.choice=<redacted>"));
+        }
+    }
+
+    #[test]
+    fn command_argument_redaction_cannot_expose_a_config_assignment() {
+        let extra = vec!["-c".to_owned(), "synthetic-program-credential".to_owned()];
+        let args = vec![
+            "-c".to_owned(),
+            "buck2_re_client.http_headers=authorization: synthetic-native-credential".to_owned(),
+            "-cbuild.threads=8".to_owned(),
+            "--".to_owned(),
+            extra[0].clone(),
+            extra[1].clone(),
+        ];
+        let input = classified_argv(
+            args.clone(),
+            ExpandedArgv::from_literals(args),
+            [
+                "buck2_re_client.http_headers=authorization: synthetic-native-credential",
+                "build.threads=8",
+            ].into_iter(),
+        );
+        let sanitized = input.redacted(extra.iter().collect());
+        assert_eq!(
+            sanitized.argv,
+            vec!["buck2_re_client.http_headers=<redacted>", "-cbuild.threads=<redacted>", "--"],
+        );
+        assert_eq!(sanitized.expanded_argv.args().collect::<Vec<_>>(), sanitized.argv);
+    }
 
     #[test]
     fn test_get_representative_config_flags() -> buck2_error::Result<()> {
@@ -389,12 +568,12 @@ mod tests {
         assert_eq!(
             flags,
             vec![
-                "-c section.option=value",
-                "-c section1.option=value",
-                "-c section2.option=value",
-                "-c section.option2=value",
-                "-c section.option3=value",
-                "-c section.option4=value",
+                "-c section.option=<redacted>",
+                "-c section1.option=<redacted>",
+                "-c section2.option=<redacted>",
+                "-c section.option2=<redacted>",
+                "-c section.option3=<redacted>",
+                "-c section.option4=<redacted>",
                 "--config-file //1.bcfg",
                 "--config-file //2.bcfg",
                 "-m //bar:baz",
@@ -460,8 +639,8 @@ mod tests {
                 "-m //bar:baz",
                 "@root//mode/1",
                 "@root//mode/2",
-                "-c a.b5=c",
-                "-c a.b6=c"
+                "-c a.b5=<redacted>",
+                "-c a.b6=<redacted>"
             ]
         );
         Ok(())
@@ -485,7 +664,7 @@ mod tests {
 
         assert_eq!(
             flags,
-            vec!["-c section.option=value", "-c section.option2=value",]
+            vec!["-c section.option=<redacted>", "-c section.option2=<redacted>",]
         );
         Ok(())
     }

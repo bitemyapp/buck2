@@ -50,6 +50,7 @@ struct ParanoidDownloaderInner {
     io: Arc<dyn BlockingExecutor>,
     re: Arc<ReConnectionManager>,
     cache_path: ProjectRelativePathBuf,
+    digest_config: buck2_execute::digest_config::DigestConfig,
 }
 
 impl ParanoidDownloader {
@@ -58,6 +59,7 @@ impl ParanoidDownloader {
         io: Arc<dyn BlockingExecutor>,
         re: Arc<ReConnectionManager>,
         cache_path: ProjectRelativePathBuf,
+        digest_config: buck2_execute::digest_config::DigestConfig,
     ) -> Self {
         Self {
             inner: Arc::new(ParanoidDownloaderInner {
@@ -65,6 +67,7 @@ impl ParanoidDownloader {
                 io,
                 re,
                 cache_path,
+                digest_config,
             }),
         }
     }
@@ -115,6 +118,7 @@ impl ParanoidDownloader {
                     &info,
                     cache_artifacts,
                     cancellations,
+                    inner.digest_config,
                 )
                 .await?;
 

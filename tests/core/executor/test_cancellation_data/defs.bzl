@@ -29,3 +29,34 @@ slow_actions = rule(
         "src": attrs.source(),
     },
 )
+
+def _priority_impl(ctx):
+    outputs = {}
+    for name in ["active", "low_gate", "high_gate", "low_a", "low_b", "critical"]:
+        output = ctx.actions.declare_output(name)
+        dependencies = []
+        if name in ["low_a", "low_b", "high_gate"]:
+            dependencies = [outputs["low_gate"]]
+        elif name == "critical":
+            dependencies = [outputs["high_gate"]]
+        kwargs = {"weight_percentage": 0} if name.endswith("_gate") else {"weight": 2}
+        ctx.actions.run(
+            cmd_args(ctx.attrs.python, ctx.attrs.src, ctx.attrs.state, name, output.as_output(), hidden = dependencies),
+            category = "priority_smoke",
+            identifier = name,
+            priority = 10 if name == "critical" else 0,
+            local_only = True,
+            low_pass_filter = False,
+            **kwargs
+        )
+        outputs[name] = output
+    return [DefaultInfo(default_outputs = outputs.values())]
+
+priority_actions = rule(
+    impl = _priority_impl,
+    attrs = {
+        "python": attrs.string(),
+        "src": attrs.source(),
+        "state": attrs.string(),
+    },
+)

@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 // This triggers on Arc<Arc<...>>, but we do that here for lifetime/ownership reasons
 #![allow(clippy::redundant_allocation)]
@@ -411,6 +411,7 @@ impl ManagedRemoteExecutionClient {
         dir_path: &ProjectRelativePath,
         input_dir: &ActionImmutableDirectory,
         identity: Option<&ReActionIdentity<'_>>,
+        negative_cache: NegativeCache,
     ) -> buck2_error::Result<UploadStats> {
         self.lock()?
             .get()
@@ -423,6 +424,7 @@ impl ManagedRemoteExecutionClient {
                 input_dir,
                 self.use_case,
                 identity,
+                negative_cache,
             )
             .await
     }

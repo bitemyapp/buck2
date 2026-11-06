@@ -91,6 +91,7 @@ rust_library(
     ] + select({
         "DEFAULT": [],
         "ovr_config//os:linux": [
+            "fbsource//third-party/rust:rayon",
             "//buck2/app/buck2_forkserver:buck2_forkserver",
             "//buck2/app/buck2_forkserver_proto:buck2_forkserver_proto",
             # @oss-disable[end= ]: "//common/rust/shed/hostcaps:hostcaps",

@@ -31,8 +31,8 @@ pub struct CacheUploadInfo<'a> {
     pub digest_config: DigestConfig,
     pub mergebase: &'a Option<String>,
     pub re_platform: &'a remote_execution::Platform,
-    /// Whether locally produced results may be published. Results that came from RE
-    /// (remote executions and action-cache hits) are already published.
+    /// Whether local results or source-only aliases for incremental RE results
+    /// may be published. Ordinary RE results are already published.
     pub allow_cache_upload: bool,
 }
 

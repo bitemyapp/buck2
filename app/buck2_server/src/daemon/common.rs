@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -37,6 +37,7 @@ use buck2_core::fs::project::ProjectRoot;
 use buck2_events::daemon_id::DaemonId;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::cache_uploader::NoOpCacheUploader;
+use buck2_execute::execute::cache_uploader::UploadCache;
 use buck2_execute::execute::cache_uploader::force_cache_upload;
 use buck2_execute::execute::prepared::NoOpCommandOptionalExecutor;
 use buck2_execute::execute::prepared::PreparedCommandExecutor;
@@ -350,10 +351,32 @@ impl HasCommandExecutor for CommandExecutorFactory {
                     (action_cache_checker, remote_dep_file_cache_checker)
                 };
 
+                let upload_limit = if force_cache_upload()? {
+                    Some(None)
+                } else if disable_caching {
+                    None
+                } else if let CacheUploadBehavior::Enabled { max_bytes } =
+                    remote_options.cache_upload_behavior
+                {
+                    Some(max_bytes)
+                } else {
+                    None
+                };
+                let cache_uploader = upload_limit.map(|max_bytes| Arc::new(CacheUploader::new(
+                    artifact_fs.dupe(),
+                    self.materializer.dupe(),
+                    re_client.dupe(),
+                    self.invocation_re_use_case,
+                    remote_options.re_properties.clone(),
+                    max_bytes,
+                    self.cache_upload_permission_checker.dupe(),
+                )));
+
                 let executor: Option<Arc<dyn PreparedCommandExecutor>> =
                     match &remote_options.executor {
                         RemoteEnabledExecutor::Local(local) if !self.strategy.ban_local() => {
-                            Some(Arc::new(local_executor_new(local)))
+                            Some(Arc::new(local_executor_new(local)
+                                .with_cache_uploader(cache_uploader.clone())))
                         }
                         RemoteEnabledExecutor::Remote(remote) if !self.strategy.ban_remote() => {
                             Some(Arc::new(remote_executor_new(
@@ -374,7 +397,8 @@ impl HasCommandExecutor for CommandExecutorFactory {
                             let re_max_input_files_bytes = remote
                                 .re_max_input_files_bytes
                                 .unwrap_or(DEFAULT_RE_MAX_INPUT_FILE_BYTES);
-                            let local = local_executor_new(local);
+                            let local = local_executor_new(local)
+                                .with_cache_uploader(cache_uploader.clone());
                             let remote = remote_executor_new(
                                 remote,
                                 &re_client,
@@ -435,40 +459,15 @@ impl HasCommandExecutor for CommandExecutorFactory {
                         cache_checker_new()
                     };
 
-                let cache_uploader = if force_cache_upload()? {
-                    Arc::new(CacheUploader::new(
-                        artifact_fs.dupe(),
-                        self.materializer.dupe(),
-                        re_client.dupe(),
-                        self.invocation_re_use_case,
-                        remote_options.re_properties.clone(),
-                        None,
-                        self.cache_upload_permission_checker.dupe(),
-                    )) as _
-                } else if disable_caching {
-                    Arc::new(NoOpCacheUploader {}) as _
-                } else if let CacheUploadBehavior::Enabled { max_bytes } =
-                    remote_options.cache_upload_behavior
-                {
-                    Arc::new(CacheUploader::new(
-                        artifact_fs.dupe(),
-                        self.materializer.dupe(),
-                        re_client.dupe(),
-                        self.invocation_re_use_case,
-                        remote_options.re_properties.clone(),
-                        max_bytes,
-                        self.cache_upload_permission_checker.dupe(),
-                    )) as _
-                } else {
-                    Arc::new(NoOpCacheUploader {}) as _
-                };
 
                 executor.map(|executor| CommandExecutorResponse {
                     executor,
                     platform: remote_options.re_properties.to_re_platform(),
                     action_cache_checker,
                     remote_dep_file_cache_checker,
-                    cache_uploader,
+                    cache_uploader: cache_uploader
+                        .map(|uploader| uploader as Arc<dyn UploadCache>)
+                        .unwrap_or_else(|| Arc::new(NoOpCacheUploader {})),
                     output_trees_download_config: self.output_trees_download_config.dupe(),
                 })
             }

@@ -6,9 +6,12 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 pub mod artifact_type;
 pub mod deferred;
 pub mod immediate;
 pub mod io;
+pub(crate) mod local_content_store;
+#[cfg(target_os = "linux")]
+pub(crate) mod prepared_outputs;

@@ -504,10 +504,19 @@ pub struct Buck2OssReConfiguration {
     pub max_concurrency_per_connection: Option<usize>,
 }
 
-#[derive(Clone, Debug, Default, Allocative)]
+#[derive(Clone, Default, Allocative)]
 pub struct HttpHeader {
     pub key: String,
     pub value: String,
+}
+
+impl std::fmt::Debug for HttpHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpHeader")
+            .field("key", &"<redacted>")
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 impl FromStr for HttpHeader {
@@ -522,8 +531,7 @@ impl FromStr for HttpHeader {
             }),
             _ => Err(buck2_error::buck2_error!(
                 buck2_error::ErrorTag::Input,
-                "Invalid header (expect name and value separated by `:`): `{}`",
-                s
+                "Invalid header (expect name and value separated by `:`)"
             )),
         }
     }
@@ -647,3 +655,36 @@ impl Buck2OssReConfiguration {
 pub use fbcode::RemoteExecutionStaticMetadata;
 #[cfg(not(fbcode_build))]
 pub use not_fbcode::RemoteExecutionStaticMetadata;
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+
+    #[test]
+    fn header_diagnostics_do_not_disclose_credentials() {
+        let header: HttpHeader = "authorization: Bearer synthetic-header-credential".parse().unwrap();
+        assert_eq!(header.key, "authorization");
+        assert_eq!(header.value, "Bearer synthetic-header-credential");
+        let debug = format!("{header:?}");
+        assert!(!debug.contains("synthetic-header-credential"));
+        assert!(!debug.contains("authorization"));
+        assert!(debug.contains("<redacted>"));
+
+        let error = LegacyBuckConfig::parse_list_value::<HttpHeader>(
+            BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "http_headers",
+            },
+            Some("synthetic-malformed-credential"),
+        )
+        .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(!diagnostic.contains("synthetic-malformed-credential"));
+        assert!(diagnostic.contains("conversion to"));
+        assert!(error.has_tag(buck2_error::ErrorTag::Input));
+        let direct = "synthetic-malformed-credential".parse::<HttpHeader>().unwrap_err();
+        assert!(!format!("{direct:#}").contains("synthetic-malformed-credential"));
+        assert!(format!("{direct:#}").contains("Invalid header"));
+        assert!(diagnostic.contains("buck2_re_client.http_headers"));
+    }
+}

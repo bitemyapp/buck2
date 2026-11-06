@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -122,6 +122,7 @@ use crate::re::uploader::Uploader;
 
 pub enum ActionCacheWriteType {
     LocalCacheUpload,
+    IncrementalSourceAlias,
     PermissionCheck,
     RemoteDepFile,
 }
@@ -129,6 +130,7 @@ impl ActionCacheWriteType {
     fn as_str(&self) -> &'static str {
         match *self {
             ActionCacheWriteType::LocalCacheUpload => "local_cache_upload",
+            ActionCacheWriteType::IncrementalSourceAlias => "incremental_source_alias",
             ActionCacheWriteType::PermissionCheck => "permission_check",
             ActionCacheWriteType::RemoteDepFile => "remote_dep_file",
         }
@@ -262,9 +264,19 @@ impl RemoteExecutionClient {
             match Self::new(re_config).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    if e.find_typed_context::<RemoteExecutionError>().is_none() {
-                        // If we cannot connect to RE due to some non-RE error, we should not retry
-                        // And should just return the error immediately as it's unlikely to be flakey
+                    if e
+                        .find_typed_context::<RemoteExecutionError>()
+                        .is_none_or(|error| {
+                            matches!(
+                                error.code,
+                                TCode::UNAUTHENTICATED
+                                    | TCode::PERMISSION_DENIED
+                                    | TCode::INVALID_ARGUMENT
+                            )
+                        })
+                    {
+                        // Non-RE errors, invalid configuration and rejected
+                        // credentials cannot be repaired by reconnecting.
                         return Err(e);
                     }
 
@@ -307,6 +319,7 @@ impl RemoteExecutionClient {
         input_dir: &ActionImmutableDirectory,
         use_case: RemoteExecutorUseCase,
         identity: Option<&ReActionIdentity<'_>>,
+        negative_cache: NegativeCache,
     ) -> buck2_error::Result<UploadStats> {
         // Actually upload to CAS
         let _cas = self.data.client.cas_semaphore.acquire().await;
@@ -322,6 +335,7 @@ impl RemoteExecutionClient {
                 blobs,
                 use_case,
                 identity,
+                negative_cache,
             ))
             .await
     }

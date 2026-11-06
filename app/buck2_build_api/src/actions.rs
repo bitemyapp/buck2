@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 //! This module contains support for running actions and asynchronous providers
 //!
@@ -56,6 +56,7 @@ use buck2_execute::execute::manager::CommandExecutionManager;
 use buck2_execute::execute::prepared::PreparedAction;
 use buck2_execute::execute::request::CommandExecutionRequest;
 use buck2_execute::execute::request::ExecutorPreference;
+use buck2_execute::execute::result::CommandExecutionReport;
 use buck2_execute::execute::result::CommandExecutionResult;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::manager::UnconfiguredRemoteExecutionClient;
@@ -276,6 +277,9 @@ pub trait ActionExecutionCtx: Send + Sync {
         prepared_action: &PreparedAction,
     ) -> ControlFlow<CommandExecutionResult, CommandExecutionManager>;
 
+    /// Publishes cache roots only after validating successful command outputs
+    /// against the action's declarations, returning the original output validation
+    /// error. Callers must record command reports before propagating an error.
     async fn cache_upload(
         &mut self,
         action: &ActionDigestAndBlobs,
@@ -283,7 +287,14 @@ pub trait ActionExecutionCtx: Send + Sync {
         re_result: Option<&mut TActionResult2>,
         dep_file_entry: Option<&mut dyn IntoRemoteDepFile>,
         allow_cache_upload: bool,
-    ) -> buck2_error::Result<CacheUploadResults>;
+    ) -> Result<CacheUploadResults, ExecuteError>;
+
+    /// Retains reports when a command result is unpacked or publication fails.
+    fn record_command_execution_reports(
+        &mut self,
+        rejected_execution: Option<CommandExecutionReport>,
+        report: CommandExecutionReport,
+    );
 
     /// Executes a command
     /// TODO(bobyf) this seems like it deserves critical sections?

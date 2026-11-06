@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::collections::HashMap;
 use std::env::VarError;
@@ -30,7 +30,9 @@ use async_compression::tokio::bufread::ZstdEncoder;
 use buck2_re_configuration::Buck2OssReConfiguration;
 use buck2_re_configuration::HttpHeader;
 use dupe::Dupe;
+use futures::SinkExt;
 use futures::Stream;
+use futures::channel::mpsc::Receiver;
 use futures::future::BoxFuture;
 use futures::future::Future;
 use futures::stream::BoxStream;
@@ -78,6 +80,7 @@ use re_grpc_proto::google::rpc::Status;
 use regex::Regex;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncBufRead;
+use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -125,16 +128,91 @@ fn tstatus_ok() -> TStatus {
     }
 }
 
+// The fields needed from google.rpc.PreconditionFailure. Descriptions are
+// deliberately not decoded: recovery is based only on the protocol's typed
+// violation and digest resource name, never a server's human-readable message.
+#[derive(Clone, PartialEq, Message)]
+struct PreconditionFailure {
+    #[prost(message, repeated, tag = "1")]
+    violations: Vec<PreconditionViolation>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PreconditionViolation {
+    #[prost(string, tag = "1")]
+    r#type: String,
+    #[prost(string, tag = "2")]
+    subject: String,
+}
+
+fn is_missing_blob_subject(subject: &str) -> bool {
+    let Some(resource) = subject.strip_prefix("blobs/") else {
+        return false;
+    };
+    let Some((hash, size)) = resource.rsplit_once('/') else {
+        return false;
+    };
+    let hash = match hash.split_once('/') {
+        Some((function, hash))
+            if !function.is_empty()
+                && function.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) =>
+        {
+            hash
+        }
+        Some(_) => return false,
+        None => hash,
+    };
+    !hash.is_empty()
+        && hash.bytes().all(|c| c.is_ascii_hexdigit())
+        && !size.is_empty()
+        && size.bytes().all(|c| c.is_ascii_digit())
+        && size.parse::<i64>().is_ok()
+}
+
+fn status_reason_group(status: &Status) -> TCodeReasonGroup {
+    if status.code != TCode::FAILED_PRECONDITION.0 {
+        return TCodeReasonGroup::UNKNOWN;
+    }
+    let mut missing = false;
+    for detail in &status.details {
+        if detail.type_url != "type.googleapis.com/google.rpc.PreconditionFailure" {
+            continue;
+        }
+        let Ok(failure) = PreconditionFailure::decode(detail.value.as_slice()) else {
+            return TCodeReasonGroup::UNKNOWN;
+        };
+        if failure.violations.is_empty()
+            || !failure
+                .violations
+                .iter()
+                .all(|v| v.r#type == "MISSING" && is_missing_blob_subject(&v.subject))
+        {
+            return TCodeReasonGroup::UNKNOWN;
+        }
+        missing = true;
+    }
+    if missing {
+        TCodeReasonGroup::DIGEST_NOT_FOUND
+    } else {
+        TCodeReasonGroup::UNKNOWN
+    }
+}
+
+fn error_from_status(status: Status) -> REClientError {
+    let group = status_reason_group(&status);
+    REClientError {
+        code: TCode(status.code),
+        message: status.message,
+        group,
+    }
+}
+
 fn check_status(status: Status) -> Result<(), REClientError> {
     if status.code == 0 {
         return Ok(());
     }
 
-    Err(REClientError {
-        code: TCode(status.code),
-        message: status.message,
-        group: TCodeReasonGroup::UNKNOWN,
-    })
+    Err(error_from_status(status))
 }
 
 fn ttimestamp_to(ts: &TTimestamp) -> ::prost_types::Timestamp {
@@ -243,6 +321,26 @@ pub struct REClientBuilder;
 
 impl REClientBuilder {
     pub async fn build_and_connect(opts: &Buck2OssReConfiguration) -> anyhow::Result<REClient> {
+        let missing_address = |message: &str| REClientError {
+            code: TCode::INVALID_ARGUMENT,
+            message: message.to_owned(),
+            group: TCodeReasonGroup::UNKNOWN,
+        };
+        // Missing endpoints cannot recover through connection retries. Validate
+        // all three before reading TLS files or contacting the capabilities API.
+        let engine_address = opts
+            .engine_address
+            .as_ref()
+            .ok_or_else(|| missing_address("No engine address"))?;
+        let cas_address = opts
+            .cas_address
+            .clone()
+            .ok_or_else(|| missing_address("No CAS address"))?;
+        let action_cache_address = opts
+            .action_cache_address
+            .clone()
+            .ok_or_else(|| missing_address("No action cache address"))?;
+
         // Create channel config once (reads TLS files)
         let channel_config = ChannelConfig::new(opts)
             .await
@@ -250,7 +348,6 @@ impl REClientBuilder {
 
         // Create a single channel for fetching capabilities. Other channels are created
         // on-demand through the connection pool.
-        let engine_address = opts.engine_address.as_ref().context("No engine address")?;
         let capabilities_channel = create_channel(&channel_config, engine_address)
             .context("Error creating Capabilities channel")?;
 
@@ -309,13 +406,6 @@ impl REClientBuilder {
         } else {
             None
         };
-
-        // Extract addresses
-        let cas_address = opts.cas_address.clone().context("No CAS address")?;
-        let action_cache_address = opts
-            .action_cache_address
-            .clone()
-            .context("No action cache address")?;
 
         // Create connection pool
         let min_connections = opts.min_connections.unwrap_or(1).max(1);
@@ -416,15 +506,23 @@ impl InjectHeadersInterceptor {
                 let value = substitute_env_vars(&h.value)?;
 
                 let key = MetadataKey::<metadata::Ascii>::from_bytes(key.as_bytes())
-                    .with_context(|| format!("Invalid key in header: `{key}: {value}`"))?;
+                    .context("Invalid remote execution header key")?;
 
-                let value = MetadataValue::try_from(&value)
-                    .with_context(|| format!("Invalid value in header: `{key}: {value}`"))?;
+                let mut value = MetadataValue::try_from(&value)
+                    .context("Invalid remote execution header value")?;
+                value.set_sensitive(true);
 
                 anyhow::Ok((key, value))
             })
             .collect::<Result<_, _>>()
-            .context("Error converting headers")?;
+            .context("Error converting headers")
+            .map_err(|error| {
+                error.context(REClientError {
+                    code: TCode::INVALID_ARGUMENT,
+                    message: "Invalid remote execution headers".to_owned(),
+                    group: TCodeReasonGroup::UNKNOWN,
+                })
+            })?;
 
         Ok(Self {
             headers: Arc::new(headers),
@@ -453,9 +551,9 @@ enum DigestRemoteState {
 }
 
 struct FindMissingCache {
-    cache: LruCache<TDigest, DigestRemoteState>,
-    /// To avoid a situation where we cache that an artifact is available remotely, but the artifact then expires
-    /// we clear our local cache once every `ttl`.
+    cache: LruCache<TDigest, ()>,
+    /// Optimistic upload-only knowledge. Authoritative checks always bypass
+    /// this cache; a successful lookup does not constitute a server lease.
     ttl: Duration,
     last_check: Instant,
 }
@@ -468,14 +566,28 @@ impl FindMissingCache {
         }
     }
 
-    pub fn get(&mut self, digest: &TDigest) -> Option<DigestRemoteState> {
+    pub fn get(&mut self, digest: &TDigest, allow_cached: bool) -> Option<DigestRemoteState> {
+        if !allow_cached {
+            return None;
+        }
         self.clear_if_ttl_expires();
-        self.cache.get(digest).copied()
+        self.cache
+            .get(digest)
+            .map(|()| DigestRemoteState::ExistsOnRemote)
     }
 
     pub fn put(&mut self, digest: TDigest, state: DigestRemoteState) {
         self.clear_if_ttl_expires();
-        self.cache.put(digest, state);
+        match state {
+            DigestRemoteState::ExistsOnRemote => {
+                self.cache.put(digest, ());
+            }
+            DigestRemoteState::Missing => {
+                // Uploads and completed actions can make a missing digest
+                // present immediately. Never retain negative knowledge.
+                self.cache.pop(&digest);
+            }
+        }
     }
 }
 
@@ -574,6 +686,9 @@ fn is_transient_io_error(err: &std::io::Error) -> bool {
 ///     (Unavailable, ResourceExhausted, Aborted, Cancelled)
 ///   - `io::Error` of a kind that indicates a transport-level disruption
 ///     (BrokenPipe, ConnectionReset/Aborted, UnexpectedEof, TimedOut)
+///   - A remote `h2::Error` GOAWAY with NO_ERROR: the peer is gracefully
+///     retiring the connection. Tonic maps this to Internal using its
+///     RST_STREAM mapping, so inspect the typed source, not the gRPC code.
 ///   - `h2::Error` wrapping such an `io::Error`. `h2::Error` does not
 ///     implement `source()`, so the inner `io::Error` never appears as its
 ///     own link in the chain; tonic also maps these errors to
@@ -602,6 +717,12 @@ fn is_retryable(err: &anyhow::Error) -> bool {
             }
         }
         if let Some(h2_err) = cause.downcast_ref::<h2::Error>() {
+            if h2_err.is_go_away()
+                && h2_err.is_remote()
+                && h2_err.reason() == Some(h2::Reason::NO_ERROR)
+            {
+                return true;
+            }
             if let Some(io_err) = h2_err.get_io() {
                 if is_transient_io_error(io_err) {
                     return true;
@@ -629,10 +750,17 @@ fn normalize_re_error(err: anyhow::Error) -> anyhow::Error {
     }) else {
         return err;
     };
+    let group = if status.code() == tonic::Code::FailedPrecondition {
+        Status::decode(status.details())
+            .ok()
+            .map_or(TCodeReasonGroup::UNKNOWN, |s| status_reason_group(&s))
+    } else {
+        TCodeReasonGroup::UNKNOWN
+    };
     let re_error = REClientError {
         code: TCode(status.code() as i32),
         message: status.message().to_owned(),
-        group: TCodeReasonGroup::UNKNOWN,
+        group,
     };
     err.context(re_error)
 }
@@ -640,8 +768,10 @@ fn normalize_re_error(err: anyhow::Error) -> anyhow::Error {
 /// Retry an RPC on transient connection errors and classify its final error.
 ///
 /// On retryable failure, the closure is called again from scratch — acquiring
-/// a fresh connection from the pool, rebuilding the request, etc. Up to 5
-/// attempts with exponential backoff (100ms, 200ms, 400ms, 800ms — capped at
+/// a channel from the pool and rebuilding the request. Tonic reconnects a
+/// channel whose HTTP/2 connection has received GOAWAY; no pool eviction is
+/// needed. Cache reads and content-addressed writes can safely be replayed.
+/// Up to 5 attempts with exponential backoff (100ms, 200ms, 400ms, 800ms — capped at
 /// 5s) plus 0–50ms of jitter to avoid synchronized retry storms across
 /// concurrent in-flight requests.
 async fn retry<F, Fut, T>(f: F) -> anyhow::Result<T>
@@ -835,12 +965,7 @@ impl REClient {
                     .context("Missing `result` when message was `done`")?
                 {
                     OpResult::Error(rpc_status) => {
-                        return Err(REClientError {
-                            code: TCode(rpc_status.code),
-                            message: rpc_status.message,
-                            group: TCodeReasonGroup::UNKNOWN,
-                        }
-                        .into());
+                        return Err(error_from_status(rpc_status).into());
                     }
                     OpResult::Response(any) => {
                         let execute_response_grpc: GExecuteResponse =
@@ -947,7 +1072,7 @@ impl REClient {
                         Ok(resp.into_inner())
                     }
                 },
-                |segments| {
+                |segments: Receiver<WriteRequest>| {
                     let headers = headers.clone();
                     async move {
                         let resp = self
@@ -956,7 +1081,7 @@ impl REClient {
                             .write(tonic::Request::from_parts(
                                 headers,
                                 Default::default(),
-                                futures::stream::iter(segments),
+                                segments,
                             ))
                             .await?;
                         Ok(resp.into_inner())
@@ -1059,7 +1184,9 @@ impl REClient {
             {
                 let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
                 for digest in digest_iter.by_ref() {
-                    if let Some(rs) = find_missing_cache.get(digest) {
+                    if let Some(rs) =
+                        find_missing_cache.get(digest, request.is_for_upload.unwrap_or(false))
+                    {
                         // We have our final result already cached
                         remote_results.insert(digest.clone(), rs);
                     } else {
@@ -1626,6 +1753,92 @@ where
     })
 }
 
+/// Stream one attempt with bounded read-ahead. The producer is joined here, never spawned:
+/// cancelling the request drops its reader, and even an early successful server response
+/// must wait for source EOF (or a read error) before this attempt can succeed.
+async fn upload_bytestream<Byt>(
+    resource_name: String,
+    mut reader: Box<dyn AsyncBufRead + Unpin + Send>,
+    compressor: Option<Compressor>,
+    max_chunk_size: usize,
+    write: impl FnOnce(Receiver<WriteRequest>) -> Byt,
+) -> anyhow::Result<()>
+where
+    Byt: Future<Output = anyhow::Result<WriteResponse>> + Send,
+{
+    // Check before compression, which can emit a header even for empty input.
+    if reader.fill_buf().await?.is_empty() {
+        return Ok(());
+    }
+    let mut reader: Pin<Box<dyn AsyncRead + Unpin + Send>> = match compressor {
+        None => Pin::new(Box::new(reader)),
+        Some(Compressor::Zstd) => Pin::new(Box::new(ZstdEncoder::new(reader))),
+        Some(Compressor::Deflate) => Pin::new(Box::new(DeflateEncoder::new(reader))),
+        Some(Compressor::Brotli) => Pin::new(Box::new(BrotliEncoder::new(reader))),
+    };
+    // A zero batch limit disables batching, not ByteStream reads. Cap chunks
+    // independently of the server's batch limit to bound memory per active upload.
+    let chunk_size = if max_chunk_size == 0 {
+        64 * 1024
+    } else {
+        max_chunk_size.min(64 * 1024)
+    };
+    let (mut sender, receiver) = futures::channel::mpsc::channel(1);
+    let mut response_sender = sender.clone();
+    let produce = async {
+        let mut current_offset = 0;
+        let mut data = vec![0; chunk_size];
+        let n = reader.read(&mut data).await?;
+        data.truncate(n);
+        while !data.is_empty() {
+            // One chunk of look-ahead preserves finish_write on the last data
+            // frame, including when the source ends on an exact chunk boundary.
+            let mut next = vec![0; chunk_size];
+            let n = reader.read(&mut next).await?;
+            next.truncate(n);
+            let size = data.len() as i64;
+            if sender
+                .send(WriteRequest {
+                    resource_name: resource_name.clone(),
+                    write_offset: current_offset,
+                    finish_write: next.is_empty(),
+                    data,
+                })
+                .await
+                .is_err()
+            {
+                // A completed RPC no longer needs frames, but source failures
+                // must still fail the attempt. Drain without allocating frames.
+                current_offset += size + next.len() as i64;
+                if !next.is_empty() {
+                    current_offset +=
+                        tokio::io::copy(&mut reader, &mut tokio::io::sink()).await? as i64;
+                }
+                return anyhow::Ok(current_offset);
+            }
+            current_offset += size;
+            data = next;
+        }
+        // The response future also owns a sender so explicitly signal EOF.
+        sender.close_channel();
+        anyhow::Ok(current_offset)
+    };
+    let response = async {
+        let result = write(receiver).await;
+        // An early response may leave the RPC holding its stream. Closing the
+        // channel unblocks the producer; it still drains/checks the source.
+        response_sender.close_channel();
+        result
+    };
+    let (current_offset, response) = futures::try_join!(produce, response)?;
+    if response.committed_size != current_offset && response.committed_size != -1 {
+        return Err(anyhow::anyhow!(
+            "Failed to upload `{resource_name}`: invalid committed_size from WriteResponse"
+        ));
+    }
+    Ok(())
+}
+
 async fn upload_impl<Byt, Cas>(
     instance_name: &InstanceName,
     request: UploadRequest,
@@ -1633,7 +1846,7 @@ async fn upload_impl<Byt, Cas>(
     max_total_batch_size: usize,
     max_concurrent_uploads: Option<usize>,
     cas_f: impl Fn(BatchUpdateBlobsRequest) -> Cas + Sync + Send + Copy,
-    bystream_fut: impl Fn(Vec<WriteRequest>) -> Byt + Sync + Send + Copy,
+    bystream_fut: impl Fn(Receiver<WriteRequest>) -> Byt + Sync + Send + Copy,
 ) -> anyhow::Result<UploadResponse>
 where
     Cas: Future<Output = anyhow::Result<BatchUpdateBlobsResponse>> + Send,
@@ -1672,48 +1885,14 @@ where
     // https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto#L205
     let mut batched_blob_updates = BatchUploadReqAggregator::new(max_total_batch_size);
 
-    // Adapt the given bystream_fut to take in an AsyncBufRead
-    let bystream_fut = |resource_name: String, reader: Box<dyn AsyncBufRead + Unpin + Send>| async move {
-        let mut reader: Pin<Box<dyn AsyncRead + Unpin + Send>> = match bystream_compressor {
-            None => Pin::new(Box::new(reader)),
-            Some(Compressor::Zstd) => Pin::new(Box::new(ZstdEncoder::new(reader))),
-            Some(Compressor::Deflate) => Pin::new(Box::new(DeflateEncoder::new(reader))),
-            Some(Compressor::Brotli) => Pin::new(Box::new(BrotliEncoder::new(reader))),
-        };
-
-        let mut current_offset = 0;
-        let mut upload_segments = Vec::new();
-        let mut buf = vec![0; max_total_batch_size];
-        loop {
-            let n_read = reader.read(&mut buf).await?;
-            if n_read == 0 {
-                break;
-            }
-            upload_segments.push(WriteRequest {
-                resource_name: resource_name.clone(),
-                write_offset: current_offset,
-                finish_write: false,
-                data: buf[0..n_read].to_vec(),
-            });
-            current_offset += n_read as i64;
-        }
-        if let Some(last_segment) = upload_segments.last_mut() {
-            last_segment.finish_write = true;
-        }
-
-        if upload_segments.is_empty() {
-            // As an optimization, we can silently skip uploading empty blobs
-            return Ok(());
-        }
-
-        let response = bystream_fut(upload_segments).await?;
-        if response.committed_size != current_offset && response.committed_size != -1 {
-            return Err(anyhow::anyhow!(
-                "Failed to upload `{resource_name}`: invalid committed_size from WriteResponse"
-            ));
-        }
-
-        Ok(())
+    let bystream_fut = |resource_name, reader| {
+        upload_bytestream(
+            resource_name,
+            reader,
+            bystream_compressor,
+            max_total_batch_size,
+            bystream_fut,
+        )
     };
 
     // Create futures for any blobs that need uploading.
@@ -1956,7 +2135,14 @@ fn substitute_env_vars_impl(
     for mat in ENV_REGEX.find_iter(s) {
         out.push_str(&s[last_idx..mat.start()]);
         let var = &mat.as_str()[1..];
-        let val = getter(var).with_context(|| format!("Error substituting `{}`", mat.as_str()))?;
+        let val = getter(var).map_err(|error| match error {
+            VarError::NotPresent => {
+                anyhow::anyhow!("Missing environment variable in remote execution header")
+            }
+            VarError::NotUnicode(_) => {
+                anyhow::anyhow!("Non-UTF-8 environment variable in remote execution header")
+            }
+        })?;
         out.push_str(&val);
         last_idx = mat.end();
     }
@@ -1971,12 +2157,631 @@ fn substitute_env_vars_impl(
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::Ordering;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU16;
+    use std::sync::atomic::AtomicUsize;
 
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_read_blobs_response;
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_response;
 
     use super::*;
+
+    struct UploadTestReader {
+        remaining: usize,
+        read_bytes: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+        fail_at_end: bool,
+    }
+
+    impl AsyncRead for UploadTestReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if self.remaining == 0 && self.fail_at_end {
+                return std::task::Poll::Ready(Err(io::Error::other("source read failed")));
+            }
+            let n = self.remaining.min(buf.remaining());
+            buf.initialize_unfilled_to(n).fill(b'x');
+            buf.advance(n);
+            self.remaining -= n;
+            self.read_bytes.fetch_add(n, Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Drop for UploadTestReader {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_early_success_drains_source() -> anyhow::Result<()> {
+        for committed_size in [-1, 128] {
+            let read_bytes = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let reader = UploadTestReader {
+                remaining: 128,
+                read_bytes: read_bytes.clone(),
+                dropped: dropped.clone(),
+                fail_at_end: false,
+            };
+            upload_bytestream(
+                "uploads/test".to_owned(),
+                Box::new(BufReader::with_capacity(4, reader)),
+                None,
+                4,
+                |_requests| async {
+                    assert!(read_bytes.load(Ordering::SeqCst) < 128);
+                    Ok(WriteResponse { committed_size })
+                },
+            )
+            .await?;
+            assert_eq!(read_bytes.load(Ordering::SeqCst), 128);
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_retry_reopens_file() -> anyhow::Result<()> {
+        let work = tempfile::tempdir()?;
+        let path = work.path().join("blob");
+        let data: Vec<u8> = (0..128).collect();
+        tokio::fs::write(&path, &data).await?;
+        let attempts = AtomicUsize::new(0);
+        let expected = &data;
+        upload_impl(
+            &InstanceName(None),
+            UploadRequest {
+                files_with_digest: Some(vec![NamedDigest {
+                    name: path.to_str().context("tempdir is not utf8")?.to_owned(),
+                    digest: TDigest {
+                        hash: "test".to_owned(),
+                        size_in_bytes: data.len() as i64,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            None,
+            4,
+            Some(1),
+            |_request| async { panic!("not a batch upload") },
+            |mut requests| {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let first = requests.next().await.unwrap();
+                    assert_eq!(first.write_offset, 0);
+                    assert_eq!(first.data, expected[..4]);
+                    if attempt == 0 {
+                        return Err(tonic::Status::unavailable("retry this attempt").into());
+                    }
+                    assert_eq!(attempt, 1);
+                    let mut received = first.data;
+                    let mut finished = false;
+                    while let Some(request) = requests.next().await {
+                        assert!(!finished);
+                        assert_eq!(request.write_offset, received.len() as i64);
+                        finished = request.finish_write;
+                        received.extend(request.data);
+                    }
+                    assert!(finished);
+                    assert_eq!(&received, expected);
+                    Ok(WriteResponse {
+                        committed_size: received.len() as i64,
+                    })
+                }
+            },
+        )
+        .await?;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_backpressure_and_final_frame() -> anyhow::Result<()> {
+        for size in [127, 128] {
+            let read_bytes = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let reader = UploadTestReader {
+                remaining: size,
+                read_bytes: read_bytes.clone(),
+                dropped: dropped.clone(),
+                fail_at_end: false,
+            };
+            let read_bytes_ref = &read_bytes;
+            upload_bytestream(
+                "uploads/test".to_owned(),
+                Box::new(BufReader::with_capacity(4, reader)),
+                None,
+                4,
+                |mut requests| async move {
+                    let mut offset = 0;
+                    while let Some(request) = requests.next().await {
+                        if offset == 0 {
+                            // The bounded producer must stop reading while the
+                            // consumer has not polled, not just split a full buffer.
+                            assert!(read_bytes_ref.load(Ordering::SeqCst) <= 32);
+                        }
+                        assert_eq!(request.resource_name, "uploads/test");
+                        assert_eq!(request.write_offset, offset as i64);
+                        assert!(!request.data.is_empty());
+                        assert!(request.data.len() <= 4);
+                        assert!(request.data.iter().all(|b| *b == b'x'));
+                        offset += request.data.len();
+                        assert_eq!(request.finish_write, offset == size);
+                    }
+                    assert_eq!(offset, size);
+                    Ok(WriteResponse {
+                        committed_size: offset as i64,
+                    })
+                },
+            )
+            .await?;
+            assert_eq!(read_bytes.load(Ordering::SeqCst), size);
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_read_error_after_early_success() {
+        for committed_size in [-1, 128] {
+            let read_bytes = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let reader = UploadTestReader {
+                remaining: 128,
+                read_bytes: read_bytes.clone(),
+                dropped: dropped.clone(),
+                fail_at_end: true,
+            };
+            let error = upload_bytestream(
+                "uploads/test".to_owned(),
+                Box::new(BufReader::with_capacity(4, reader)),
+                None,
+                4,
+                |_requests| async {
+                    assert!(read_bytes.load(Ordering::SeqCst) < 128);
+                    Ok(WriteResponse { committed_size })
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.to_string(), "source read failed");
+            assert_eq!(read_bytes.load(Ordering::SeqCst), 128);
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_read_error_cancels_rpc() {
+        let reader = UploadTestReader {
+            remaining: 128,
+            read_bytes: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::new(AtomicBool::new(false)),
+            fail_at_end: true,
+        };
+        let error = upload_bytestream(
+            "uploads/test".to_owned(),
+            Box::new(BufReader::with_capacity(4, reader)),
+            None,
+            4,
+            |mut requests| async move {
+                while let Some(request) = requests.next().await {
+                    assert!(!request.finish_write);
+                }
+                futures::future::pending::<anyhow::Result<WriteResponse>>().await
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "source read failed");
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_cancellation_drops_source() {
+        let read_bytes = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let reader = UploadTestReader {
+            remaining: 128,
+            read_bytes: read_bytes.clone(),
+            dropped: dropped.clone(),
+            fail_at_end: false,
+        };
+        let mut upload = Box::pin(upload_bytestream(
+            "uploads/test".to_owned(),
+            Box::new(BufReader::with_capacity(4, reader)),
+            None,
+            4,
+            |requests| async move {
+                // Retain the receiver without consuming it, as a stalled RPC does.
+                let result = futures::future::pending::<anyhow::Result<WriteResponse>>().await;
+                drop(requests);
+                result
+            },
+        ));
+        assert!(futures::poll!(upload.as_mut()).is_pending());
+        assert!(read_bytes.load(Ordering::SeqCst) <= 32);
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(upload);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_rpc_error_drops_source() {
+        let read_bytes = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let reader = UploadTestReader {
+            remaining: 128,
+            read_bytes: read_bytes.clone(),
+            dropped: dropped.clone(),
+            fail_at_end: false,
+        };
+        let error = upload_bytestream(
+            "uploads/test".to_owned(),
+            Box::new(BufReader::with_capacity(4, reader)),
+            None,
+            4,
+            |_requests| async { Err(anyhow::anyhow!("RPC failed")) },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "RPC failed");
+        assert!(read_bytes.load(Ordering::SeqCst) < 128);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_compressors() -> anyhow::Result<()> {
+        let data: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+        for compressor in [
+            None,
+            Some(Compressor::Zstd),
+            Some(Compressor::Deflate),
+            Some(Compressor::Brotli),
+        ] {
+            let expected = &data;
+            upload_bytestream(
+                "uploads/test".to_owned(),
+                Box::new(Cursor::new(data.clone())),
+                compressor,
+                13,
+                |mut requests| async move {
+                    let mut encoded = Vec::new();
+                    let mut finished = false;
+                    while let Some(request) = requests.next().await {
+                        assert!(!finished);
+                        assert_eq!(request.write_offset, encoded.len() as i64);
+                        assert!(!request.data.is_empty());
+                        assert!(request.data.len() <= 13);
+                        finished = request.finish_write;
+                        encoded.extend(request.data);
+                    }
+                    assert!(finished);
+                    let committed_size = encoded.len() as i64;
+                    let mut decoder: Box<dyn AsyncRead + Unpin + Send> = match compressor {
+                        None => Box::new(Cursor::new(encoded)),
+                        Some(Compressor::Zstd) => Box::new(ZstdDecoder::new(Cursor::new(encoded))),
+                        Some(Compressor::Deflate) => {
+                            Box::new(DeflateDecoder::new(Cursor::new(encoded)))
+                        }
+                        Some(Compressor::Brotli) => {
+                            Box::new(BrotliDecoder::new(Cursor::new(encoded)))
+                        }
+                    };
+                    let mut decoded = Vec::new();
+                    decoder.read_to_end(&mut decoded).await?;
+                    assert_eq!(&decoded, expected);
+                    Ok(WriteResponse { committed_size })
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_zero_batch_limit() -> anyhow::Result<()> {
+        upload_bytestream(
+            "uploads/test".to_owned(),
+            Box::new(Cursor::new(b"data".to_vec())),
+            None,
+            0,
+            |mut requests| async move {
+                let request = requests.next().await.unwrap();
+                assert_eq!(request.data, b"data");
+                assert_eq!(request.write_offset, 0);
+                assert!(request.finish_write);
+                assert!(requests.next().await.is_none());
+                Ok(WriteResponse { committed_size: 4 })
+            },
+        )
+        .await
+    }
+
+    fn missing_input_status(violation_type: &str, subject: &str) -> Status {
+        Status {
+            code: TCode::FAILED_PRECONDITION.0,
+            message: "arbitrary server wording".to_owned(),
+            details: vec![prost_types::Any {
+                type_url: "type.googleapis.com/google.rpc.PreconditionFailure".to_owned(),
+                value: PreconditionFailure {
+                    violations: vec![PreconditionViolation {
+                        r#type: violation_type.to_owned(),
+                        subject: subject.to_owned(),
+                    }],
+                }
+                .encode_to_vec(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_missing_input_status_preserves_typed_reason() {
+        for subject in [
+            "blobs/aa/0",
+            "blobs/blake3/aa/42",
+            "blobs/06a608a5c67942e55c50f43515ae137009100547be310fbffb056871fd12e78f/986808",
+        ] {
+            let status = missing_input_status("MISSING", subject);
+            let operation_error = error_from_status(status.clone());
+            assert_eq!(operation_error.code, TCode::FAILED_PRECONDITION);
+            assert_eq!(operation_error.group, TCodeReasonGroup::DIGEST_NOT_FOUND);
+            let response = GExecuteResponse {
+                status: Some(status),
+                ..Default::default()
+            };
+            let encoded = response.encode_to_vec();
+            let response = GExecuteResponse::decode(encoded.as_slice()).unwrap();
+            let error = check_status(response.status.unwrap()).unwrap_err();
+            assert_eq!(error.group, TCodeReasonGroup::DIGEST_NOT_FOUND);
+        }
+    }
+
+    #[test]
+    fn test_missing_input_requires_valid_structured_blob_violation() {
+        for (violation_type, subject) in [
+            ("OTHER", "blobs/aa/1"),
+            ("MISSING", "workers/default"),
+            ("MISSING", "blobs//1"),
+            ("MISSING", "blobs/not-a-hash/1"),
+            ("MISSING", "blobs/aa/-1"),
+            ("MISSING", "blobs/aa/+1"),
+            ("MISSING", "blobs/aa/9223372036854775808"),
+            ("MISSING", "blobs/aa/1/extra"),
+        ] {
+            assert_eq!(
+                status_reason_group(&missing_input_status(violation_type, subject)),
+                TCodeReasonGroup::UNKNOWN,
+                "{violation_type}: {subject}",
+            );
+        }
+        let mut status = missing_input_status("MISSING", "blobs/aa/1");
+        for code in [
+            TCode::NOT_FOUND,
+            TCode::UNAUTHENTICATED,
+            TCode::PERMISSION_DENIED,
+            TCode::INTERNAL,
+        ] {
+            status.code = code.0;
+            assert_eq!(status_reason_group(&status), TCodeReasonGroup::UNKNOWN);
+        }
+        status.code = TCode::FAILED_PRECONDITION.0;
+        status.details[0].value = vec![0xff];
+        assert_eq!(status_reason_group(&status), TCodeReasonGroup::UNKNOWN);
+        status.details.clear();
+        status.message = "action input missing from CAS: blobs/aa/1".to_owned();
+        assert_eq!(status_reason_group(&status), TCodeReasonGroup::UNKNOWN);
+    }
+
+    #[test]
+    fn test_missing_input_rejects_mixed_preconditions() {
+        let mut status = missing_input_status("MISSING", "blobs/aa/1");
+        status.details.extend(missing_input_status("OTHER", "workers/pool").details);
+        assert_eq!(status_reason_group(&status), TCodeReasonGroup::UNKNOWN);
+        let mut status = missing_input_status("MISSING", "blobs/aa/1");
+        status.details[0].type_url = "type.example/PreconditionFailure".to_owned();
+        assert_eq!(status_reason_group(&status), TCodeReasonGroup::UNKNOWN);
+    }
+
+    #[tokio::test]
+    async fn test_missing_input_is_classified_without_rpc_retries() {
+        for (outer_code, inner_code, expected_group) in [
+            (
+                tonic::Code::FailedPrecondition,
+                TCode::FAILED_PRECONDITION,
+                TCodeReasonGroup::DIGEST_NOT_FOUND,
+            ),
+            (
+                tonic::Code::Unauthenticated,
+                TCode::FAILED_PRECONDITION,
+                TCodeReasonGroup::UNKNOWN,
+            ),
+            (
+                tonic::Code::PermissionDenied,
+                TCode::FAILED_PRECONDITION,
+                TCodeReasonGroup::UNKNOWN,
+            ),
+            (
+                tonic::Code::FailedPrecondition,
+                TCode::UNAUTHENTICATED,
+                TCodeReasonGroup::UNKNOWN,
+            ),
+        ] {
+            let mut status = missing_input_status("MISSING", "blobs/aa/1");
+            status.code = inner_code.0;
+            let details = prost::bytes::Bytes::from(status.encode_to_vec());
+            let attempts = AtomicU16::new(0);
+            let error = retry(|| async {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err::<(), _>(anyhow::Error::new(tonic::Status::with_details(
+                    outer_code,
+                    "arbitrary server wording",
+                    details.clone(),
+                )))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(attempts.load(Ordering::Relaxed), 1);
+            let classified = error.downcast_ref::<REClientError>().unwrap();
+            assert_eq!(classified.code, TCode(outer_code as i32));
+            assert_eq!(classified.group, expected_group);
+            assert!(error.downcast_ref::<tonic::Status>().is_some());
+        }
+    }
+
+    #[test]
+    fn test_authoritative_presence_bypasses_cache_and_misses_are_not_cached() {
+        let digest = TDigest {
+            hash: "aa".to_owned(),
+            size_in_bytes: 1,
+            ..Default::default()
+        };
+        let mut cache = FindMissingCache {
+            cache: LruCache::new(NonZeroUsize::new(8).unwrap()),
+            ttl: Duration::from_secs(60),
+            last_check: Instant::now(),
+        };
+        cache.put(digest.clone(), DigestRemoteState::ExistsOnRemote);
+        assert!(matches!(
+            cache.get(&digest, true),
+            Some(DigestRemoteState::ExistsOnRemote)
+        ));
+        assert!(cache.get(&digest, false).is_none());
+        cache.put(digest.clone(), DigestRemoteState::Missing);
+        assert!(cache.get(&digest, true).is_none());
+        assert!(cache.get(&digest, false).is_none());
+    }
+
+    // Exercise h2's actual frame handling: Error::from(Reason) does not retain
+    // whether an error was a GOAWAY, a reset, or remotely initiated.
+    async fn remote_h2_error(reason: h2::Reason, reset: bool) -> h2::Error {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (client_io, mut server_io) = tokio::io::duplex(4096);
+            let server = tokio::spawn(async move {
+                let mut preface = [0; 24];
+                server_io.read_exact(&mut preface).await.unwrap();
+                assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+                // Empty SETTINGS, followed by a terminal frame once a request
+                // is in flight. Keep reading so closing the test peer cannot
+                // turn its GOAWAY into an unrelated transport I/O error.
+                server_io.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await.unwrap();
+                loop {
+                    let mut header = [0; 9];
+                    server_io.read_exact(&mut header).await.unwrap();
+                    let len = u32::from_be_bytes([0, header[0], header[1], header[2]]);
+                    let mut payload = vec![0; len as usize];
+                    server_io.read_exact(&mut payload).await.unwrap();
+                    if header[3] == 1 {
+                        let mut frame = if reset {
+                            // RST_STREAM for the request's stream.
+                            let mut frame = vec![0, 0, 4, 3, 0];
+                            frame.extend_from_slice(&header[5..9]);
+                            frame
+                        } else {
+                            // GOAWAY with last-stream-id zero: not processed.
+                            vec![0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                        };
+                        frame.extend_from_slice(&u32::from(reason).to_be_bytes());
+                        server_io.write_all(&frame).await.unwrap();
+                        tokio::io::copy(&mut server_io, &mut tokio::io::sink()).await.unwrap();
+                        break;
+                    }
+                }
+            });
+            let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+            let driver = tokio::spawn(connection);
+            let request = http::Request::builder()
+                .uri("http://localhost/")
+                .body(())
+                .unwrap();
+            let (response, _stream) = client.send_request(request, true).unwrap();
+            let err = response.await.unwrap_err();
+            drop(client);
+            driver.abort();
+            server.abort();
+            assert!(err.is_remote(), "{err:?}");
+            assert_eq!(err.is_reset(), reset, "{err:?}");
+            assert_eq!(err.is_go_away(), !reset, "{err:?}");
+            assert_eq!(err.reason(), Some(reason));
+            err
+        })
+        .await
+        .expect("HTTP/2 peer did not complete")
+    }
+
+    #[tokio::test]
+    async fn test_retry_remote_graceful_goaway() {
+        let attempts = AtomicU16::new(0);
+        retry(|| async {
+            if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                let err = remote_h2_error(h2::Reason::NO_ERROR, false).await;
+                let status = tonic::Status::from_error(Box::new(err));
+                assert_eq!(status.code(), tonic::Code::Internal);
+                return Err(anyhow::Error::new(status).context("UpdateActionResult failed"));
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_retry_remote_graceful_goaway_exhausted() {
+        let attempts = AtomicU16::new(0);
+        let err = retry(|| async {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            let err = remote_h2_error(h2::Reason::NO_ERROR, false).await;
+            Err::<(), _>(anyhow::Error::new(tonic::Status::from_error(Box::new(err))))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts.load(Ordering::Relaxed), 5);
+        assert_eq!(
+            err.downcast_ref::<REClientError>().unwrap().code,
+            TCode::INTERNAL
+        );
+        assert!(err.chain().any(|cause| cause.is::<h2::Error>()));
+    }
+
+    #[tokio::test]
+    async fn test_retry_rejects_other_h2_errors() {
+        for (reason, reset) in [
+            (h2::Reason::PROTOCOL_ERROR, false),
+            (h2::Reason::INTERNAL_ERROR, false),
+            (h2::Reason::NO_ERROR, true),
+        ] {
+            let err = remote_h2_error(reason, reset).await;
+            let status = tonic::Status::from_error(Box::new(err));
+            assert!(!is_retryable(&anyhow::Error::new(status)));
+        }
+        assert!(!is_retryable(&anyhow::Error::new(h2::Error::from(
+            h2::Reason::NO_ERROR,
+        ))));
+    }
+
+    #[tokio::test]
+    async fn test_retry_internal_without_graceful_goaway_source() {
+        let attempts = AtomicU16::new(0);
+        let err = retry(|| async {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err::<(), _>(anyhow::Error::new(tonic::Status::internal(
+                "h2 protocol error: GoAway(NO_ERROR, Remote)",
+            )))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            err.downcast_ref::<REClientError>().unwrap().code,
+            TCode::INTERNAL
+        );
+    }
 
     #[tokio::test]
     async fn test_retry_unauthenticated() {
@@ -2736,6 +3541,7 @@ mod tests {
             |write_reqs| {
                 let blob_data = blob_data.clone();
                 async move {
+                    let write_reqs = write_reqs.collect::<Vec<_>>().await;
                     assert_eq!(write_reqs.len(), 2);
                     assert_eq!(write_reqs[0].write_offset, 0);
                     assert!(!write_reqs[0].finish_write);
@@ -2812,6 +3618,7 @@ mod tests {
             |write_reqs| {
                 let blob_data2 = blob_data2.clone();
                 async move {
+                    let write_reqs = write_reqs.collect::<Vec<_>>().await;
                     assert_eq!(write_reqs.len(), 2);
                     assert_eq!(write_reqs[0].write_offset, 0);
                     assert!(!write_reqs[0].finish_write);
@@ -2926,6 +3733,7 @@ mod tests {
                 panic!("Not called");
             },
             |write_reqs| async move {
+                let write_reqs = write_reqs.collect::<Vec<_>>().await;
                 assert_eq!(write_reqs.len(), 2);
                 assert!(write_reqs[1].finish_write);
                 anyhow::Ok(WriteResponse { committed_size: 6 })
@@ -3045,6 +3853,7 @@ mod tests {
                 panic!("Not called");
             },
             |write_reqs| async move {
+                let write_reqs = write_reqs.collect::<Vec<_>>().await;
                 assert!(write_reqs[0].resource_name.starts_with("instance/uploads/"));
                 assert!(write_reqs[0].resource_name.ends_with("/blobs/aa/3"));
                 anyhow::Ok(WriteResponse { committed_size: 3 })
@@ -3092,6 +3901,7 @@ mod tests {
                 panic!("Not called");
             },
             |write_reqs| async move {
+                let write_reqs = write_reqs.collect::<Vec<_>>().await;
                 assert!(write_reqs[0].resource_name.starts_with("instance/uploads/"));
                 assert!(
                     write_reqs[0]
@@ -3104,6 +3914,80 @@ mod tests {
         .await?;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_missing_addresses_are_configuration_errors() {
+        for missing in 0..3 {
+            let mut opts = Buck2OssReConfiguration {
+                engine_address: Some("invalid endpoint".to_owned()),
+                cas_address: Some("invalid endpoint".to_owned()),
+                action_cache_address: Some("invalid endpoint".to_owned()),
+                ..Default::default()
+            };
+            match missing {
+                0 => opts.engine_address = None,
+                1 => opts.cas_address = None,
+                2 => opts.action_cache_address = None,
+                _ => unreachable!(),
+            }
+            let error = REClientBuilder::build_and_connect(&opts)
+                .await
+                .err()
+                .expect("missing endpoint must fail before connecting");
+            assert_eq!(
+                error.downcast_ref::<REClientError>().unwrap().code,
+                TCode::INVALID_ARGUMENT,
+            );
+        }
+    }
+
+    #[test]
+    fn test_header_credentials_are_sensitive() {
+        let secret = "private-header-credential";
+        let mut interceptor = InjectHeadersInterceptor::new(&[HttpHeader {
+            key: "authorization".to_owned(),
+            value: secret.to_owned(),
+        }])
+        .unwrap();
+        let request = interceptor.call(tonic::Request::new(())).unwrap();
+        let value = request.metadata().get("authorization").unwrap();
+        assert_eq!(value.to_str().unwrap(), secret);
+        assert!(value.is_sensitive());
+        assert!(!format!("{:?}", request.metadata()).contains(secret));
+    }
+
+    #[test]
+    fn test_invalid_header_diagnostics_omit_credentials() {
+        let secret = "private-header-credential";
+        for (key, value) in [
+            ("invalid\nkey", secret.to_owned()),
+            ("authorization", format!("{secret}\n")),
+        ] {
+            let error = InjectHeadersInterceptor::new(&[HttpHeader {
+                key: key.to_owned(),
+                value,
+            }])
+            .err()
+            .expect("invalid header must fail");
+            assert_eq!(
+                error.downcast_ref::<REClientError>().unwrap().code,
+                TCode::INVALID_ARGUMENT,
+            );
+            assert!(!format!("{error:#}").contains(secret));
+            assert!(!format!("{error:?}").contains(secret));
+        }
+    }
+
+    #[test]
+    fn test_header_environment_errors_omit_credentials() {
+        let secret = "private-header-credential";
+        let error = substitute_env_vars_impl("$TOKEN", |_| {
+            Err(VarError::NotUnicode(secret.into()))
+        })
+        .unwrap_err();
+        assert!(!format!("{error:#}").contains(secret));
+        assert!(!format!("{error:?}").contains(secret));
     }
 
     #[test]
@@ -3163,6 +4047,7 @@ async fn test_upload_compressed() -> anyhow::Result<()> {
         },
         {
             |write_reqs| async move {
+                let write_reqs = write_reqs.collect::<Vec<_>>().await;
                 let compressed_data: Vec<u8> =
                     write_reqs.iter().flat_map(|wr| wr.data.clone()).collect();
                 let mut data = vec![];

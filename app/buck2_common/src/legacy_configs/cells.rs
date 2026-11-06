@@ -244,12 +244,16 @@ impl BuckConfigBasedCells {
         project_fs: &ProjectRoot,
         config_args: &[buck2_cli_proto::ConfigOverride],
     ) -> buck2_error::Result<Self> {
+        // Explicit startup layers can be include-only wrappers around private
+        // credentials. Read their full effective config before matching a daemon.
+        // Preserve the upstream fast, include-free parse when no layer is opted in.
+        let follow_includes = buck2_env!("BUCK2_EXTRA_EXTERNAL_CONFIG")?.is_some();
         Self::parse_with_file_ops_and_options(
             &mut DefaultConfigParserFileOps {
                 project_fs: project_fs.dupe(),
             },
             config_args,
-            false, /* follow includes */
+            follow_includes,
         )
         .await
     }
@@ -632,6 +636,13 @@ async fn get_project_buckconfig_paths(
                 .await?;
             }
         }
+    }
+
+    // Apply an explicit external layer at startup as well as during commands.
+    // RE clients are initialized before invocation-only --config-file arguments.
+    // Effective RE config changes are part of the daemon startup identity.
+    if let Some(path) = buck2_env!("BUCK2_EXTRA_EXTERNAL_CONFIG")? {
+        buckconfig_paths.push(ConfigPath::Global(AbsPath::new(path)?.to_owned()));
     }
 
     Ok(buckconfig_paths)

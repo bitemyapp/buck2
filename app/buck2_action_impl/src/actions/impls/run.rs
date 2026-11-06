@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::borrow::Cow;
 use std::fmt::Display;
@@ -286,6 +286,7 @@ pub(crate) struct UnregisteredRunAction {
     pub(crate) executor_preference: ExecutorPreference,
     pub(crate) always_print_stderr: bool,
     pub(crate) weight: WeightClass,
+    pub(crate) priority: i32,
     pub(crate) low_pass_filter: bool,
     pub(crate) dep_files: RunActionDepFiles,
     // Since this is usually None, use a Box to reduce memory.
@@ -1287,6 +1288,7 @@ impl RunAction {
                         .action
                         .coerce();
                     let req = req.with_remote_dep_file_key(&remote_dep_file_key);
+                    let remote_action_cache_rejected = manager.inner.remote_action_cache_rejected;
                     let remote_dep_file_result = ctx
                         .remote_dep_file_cache(manager, &req, &prepared_action)
                         .await;
@@ -1305,7 +1307,10 @@ impl RunAction {
                             .await?;
                         (
                             req,
-                            res.map_continue(|_| ctx.command_execution_manager(WaitingData::new())),
+                            res.map_continue(|_| {
+                                ctx.command_execution_manager(WaitingData::new())
+                                    .with_remote_action_cache_rejected(remote_action_cache_rejected)
+                            }),
                         )
                     } else {
                         (req, remote_dep_file_result)
@@ -1320,6 +1325,7 @@ impl RunAction {
         let (result, req, action_and_blobs) = match result {
             ControlFlow::Break(res) => (res, req, prepared_action.action_and_blobs),
             ControlFlow::Continue(mut manager) => {
+                let mut source_action_and_blobs = None;
                 manager
                     .inner
                     .waiting_data
@@ -1340,6 +1346,9 @@ impl RunAction {
                             ctx.run_action_knobs().action_paths_interner.as_ref(),
                         )?;
                         let override_prepared_action = ctx.prepare_action(&override_req, true)?;
+                        // Prior outputs are advisory execution inputs, not part
+                        // of the source-only key used by the cache lookup.
+                        source_action_and_blobs = Some(prepared_action.action_and_blobs);
                         (override_req, override_prepared_action)
                     } else {
                         (req, prepared_action)
@@ -1348,7 +1357,11 @@ impl RunAction {
                     (req, prepared_action)
                 };
                 let execution_result = ctx.exec_cmd(manager, &req, &prepared_action).await;
-                (execution_result, req, prepared_action.action_and_blobs)
+                (
+                    execution_result,
+                    req,
+                    source_action_and_blobs.unwrap_or(prepared_action.action_and_blobs),
+                )
             }
         };
 
@@ -1400,8 +1413,14 @@ impl RunAction {
             .with_prefetch_lossy_stderr(true)
             .with_executor_preference(self.inner.executor_preference)
             .with_host_sharing_requirements(host_sharing_requirements.into())
+            .with_priority(self.inner.priority)
             .with_low_pass_filter(self.inner.low_pass_filter)
             .with_outputs_cleanup(!self.inner.no_outputs_cleanup)
+            .with_pipeline_cache_upload(
+                self.inner.allow_cache_upload
+                    .unwrap_or_else(|| ctx.run_action_knobs().default_allow_cache_upload)
+                    || force_cache_upload()?,
+            )
             .with_local_environment_inheritance(EnvironmentInheritance::local_command_exclusions())
             .with_force_full_hybrid_if_capable(self.inner.force_full_hybrid_if_capable)
             .with_unique_input_inodes(self.inner.unique_input_inodes)
@@ -1785,7 +1804,7 @@ impl Action for RunAction {
             // TODO(jtbraun): D121882458 moves this upload off the action's critical path. Worth
             // adopting if missing entries, e.g. after a cache bust, make these uploads visible in
             // build wall time; its in-flight limit has to rise first or it drops most seeding uploads.
-            let upload_result = ctx
+            let upload_result = match ctx
                 .cache_upload(
                     &action_and_blobs,
                     &result,
@@ -1798,7 +1817,17 @@ impl Action for RunAction {
                     },
                     allow_cache_upload,
                 )
-                .await?;
+                .await
+            {
+                Ok(upload_result) => upload_result,
+                Err(error) => {
+                    ctx.record_command_execution_reports(
+                        result.rejected_execution,
+                        result.report,
+                    );
+                    return Err(error);
+                }
+            };
 
             result.cache_upload_result = upload_result.cache_upload_outcome.to_proto();
             result.dep_file_cache_upload_result = if supports_remote_dep_files {

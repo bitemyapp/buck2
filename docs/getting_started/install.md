@@ -87,6 +87,72 @@ nixpkgs for inspiration for writing one. An `.envrc` using the Nix flake is
 provided for `direnv` users — `direnv allow` will give a usable development
 environment.
 
+#### Shared local artifact materialization (Linux fork)
+
+This fork can share regular-file extents across independent worktrees with
+`BUCK2_LOCAL_CONTENT_STORE=/absolute/canonical/cache/path`. Its parent must
+already exist; the store itself is created with mode `0700` and must belong
+to the daemon's UID. Set this environment before starting each Buck daemon,
+and restart those daemons after changing it. Use separate roots for separate
+trust domains. This is a private machine-local cache, not a network filesystem
+or a replacement for the remote action cache.
+
+Local action outputs, write/copy actions, HTTP outputs, and downloaded remote
+outputs enter the same content-addressed store. Materializations use reflinks,
+never writable hardlinks. Every reused snapshot is hashed against its declared
+digest before atomic file publication. Executable bits are applied to each
+materialization independently; directory and symlink metadata remain managed
+by the existing materializer. Remote downloads are staged and verified before
+publication even when the optional shared store is disabled.
+
+The store and worktree outputs must be on the same reflink-capable filesystem.
+Unsupported reflinks and artifacts exceeding the configured capacity fail
+explicitly rather than silently allocating full copies. The defaults are
+10 GiB (`BUCK2_LOCAL_CONTENT_STORE_MAX_BYTES`) and 100,000 files
+(`BUCK2_LOCAL_CONTENT_STORE_MAX_ENTRIES`). A process-shared lock and SQLite LRU
+enforce these limits during active builds, not only during idle periods.
+Eviction unlinks cache objects without invalidating existing reflinks. Startup
+recovers interrupted publications and removes orphaned staging files. A corrupt
+object is removed and the current materialization fails; a subsequent attempt
+can repopulate it from a producer or the remote CAS. Permissions are not used as
+an integrity shortcut.
+
+A separately entry-bounded index of weak output paths can recover shared extents
+from a still-live worktree after canonical eviction. These hints retain no file
+data and are verified before use; stale or unsafe paths are discarded. LRU and
+weak-view updates share one durable SQLite transaction. Object accounting still
+commits before canonical publication, with file and directory synchronization
+preserved.
+
+Tree ingestion clones, verifies and synchronizes bounded groups on a dedicated
+16-thread pool; singleton work stays inline. Workers join before accounting,
+publication or cleanup. Cached groups share a metadata quantum of at most 256
+destinations or 256 MiB charged as two snapshots per destination; an oversized
+individual object runs alone and must fit the store's limits. View renames share
+one directory barrier per parent per quantum, completed before successful return.
+Canonical publication retains its own accounting and directory barriers. Both
+store locks remain held; this is not concurrent SQLite or deferred durability.
+
+Local producers can prepare private output snapshots concurrently with execution.
+Linux close-write/move events are advisory; only final output validation and
+content hashes authorize reuse or successful action-cache publication. Four
+process-wide batches of eight files share a 512 MiB/4,096-pair budget, charging
+two 4-KiB-rounded snapshots per file with no oversized exception. Prepared
+publication views remain writable and independent; CAS uploads use a separate
+stable snapshot and bounded streaming. Cancellation joins capture work and stops
+pending uploads. Failed actions can leave unreferenced CAS blobs, never a
+successful result. Write permissions and action/executor policy still apply;
+whole-action upload-size limits retain final-only remote uploads. This does not
+pipeline remote-worker ingestion or defer final root publication beyond the
+action's completion.
+
+The capacity covers cache object logical bytes, plus filesystem block rounding,
+bounded index metadata, and bounded publication staging. It does not cap live worktree
+outputs or Buck's daemon state; use the
+existing deferred-materialization and clean-stale policies for those. Separate
+worktrees can still execute identical actions concurrently; this store shares
+their resulting extents, not their action execution.
+
 ### `protoc` on non-Tier-1 platforms
 
 Buck2 uses Protocol Buffers extensively, both internally and to talk to remote

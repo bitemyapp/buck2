@@ -12,6 +12,7 @@
 import sys
 
 from buck2.tests.e2e_util.api.buck import Buck
+from buck2.tests.e2e_util.asserts import expect_failure
 from buck2.tests.e2e_util.buck_workspace import buck_test
 from buck2.tests.e2e_util.helper.utils import json_get, random_string
 
@@ -99,3 +100,51 @@ async def test_re_uploads_default(buck: Buck) -> None:
     ]
     await buck.build("root//:write_default", *args)
     await _assert_locally_executed_upload_attempted(buck, 1)
+
+
+@buck_test()
+async def test_invalid_outputs_do_not_publish_cache_roots(buck: Buck) -> None:
+    for target, error in [
+        ("write_missing_output", "Action failed to produce outputs"),
+        ("write_wrong_output_type", "Action didn't produce output of the right type"),
+    ]:
+        await expect_failure(
+            buck.build(
+                f"root//:{target}",
+                "-c",
+                f"write.text={random_string()}",
+            ),
+            stderr_regex=error,
+        )
+        # Unlike the positive upload helper, reject every upload attempt, including
+        # infrastructure failures. Invalid outputs must never reach the uploader.
+        log = (await buck.log("show")).stdout.strip().splitlines()
+        uploads = [
+            event
+            for line in log
+            if (
+                event := json_get(
+                    line, "Event", "data", "SpanEnd", "data", "CacheUpload"
+                )
+            )
+            is not None
+        ]
+        assert not uploads, uploads
+        commands = [
+            command
+            for line in log
+            for command in (
+                json_get(
+                    line,
+                    "Event",
+                    "data",
+                    "SpanEnd",
+                    "data",
+                    "ActionExecution",
+                    "commands",
+                )
+                or []
+            )
+        ]
+        assert [command["status"] for command in commands] == [{"Success": {}}]
+        assert commands[0]["details"]["signed_exit_code"] == 0

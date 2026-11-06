@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 pub mod action_cache;
 pub mod action_cache_upload_permission_checker;
@@ -14,6 +14,10 @@ pub mod caching;
 pub(crate) mod empty_action_result;
 pub mod hybrid;
 pub mod local;
+#[cfg(target_os = "linux")]
+pub(crate) mod output_pipeline;
+#[cfg(target_os = "linux")]
+pub(crate) mod output_watcher;
 pub mod re;
 pub mod stacked;
 pub mod to_re_platform;

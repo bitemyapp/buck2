@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -49,6 +49,8 @@ use buck2_execute::re::client::CancellationReason;
 use buck2_execute::re::client::ExecuteResponseOrCancelled;
 use buck2_execute::re::error::RemoteExecutionError;
 use buck2_execute::re::error::get_re_error_tag;
+use buck2_execute::re::error::is_missing_cas_input;
+use buck2_execute::re::error::report_cas_corruption;
 use buck2_execute::re::manager::ManagedRemoteExecutionClient;
 use buck2_execute::re::output_trees_download_config::OutputTreesDownloadConfig;
 use buck2_execute::re::remote_action_result::ExecuteResponseWithQueueStats;
@@ -121,6 +123,7 @@ impl ReExecutor {
                     ProjectRelativePath::empty(),
                     paths.input_directory(),
                     Some(identity),
+                    buck2_execute::re::presence::NegativeCache::Allowed,
                 )
                 .await;
             match res {
@@ -185,6 +188,9 @@ impl ReExecutor {
 
         let now = TimeSpan::start_now();
 
+        let skip_cache_lookup = self.skip_cache_read
+            || request.induced_cache_miss()
+            || manager.inner.remote_action_cache_rejected;
         let execute_response_fut = self.re_client.execute(
             action_digest.dupe(),
             platform,
@@ -192,7 +198,7 @@ impl ReExecutor {
             re_gang_workers,
             identity,
             &mut manager,
-            self.skip_cache_read || request.induced_cache_miss(),
+            skip_cache_lookup,
             self.skip_cache_write,
             self.re_max_queue_time,
             self.re_resource_units,
@@ -275,6 +281,11 @@ impl ReExecutor {
                             CommandExecutionMetadata::empty(TimeSpan::empty_now()),
                         ));
                     }
+                    let e = if is_missing_cas_input(&e) {
+                        report_cas_corruption(e, false)
+                    } else {
+                        e
+                    };
                     return ControlFlow::Break(manager.error("remote_call_error", e));
                 }
             };
@@ -516,7 +527,22 @@ impl PreparedCommandExecutor for ReExecutor {
         .boxed()
         .await;
 
-        let DownloadResult::Result(mut res) = res;
+        let mut res = match res {
+            DownloadResult::Result(res) => res,
+            DownloadResult::CacheMiss(manager) => {
+                return manager.error(
+                    "remote_cache_missing_outputs",
+                    report_cas_corruption(
+                        buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::ReCasArtifactExpired,
+                            "Cached remote action {} references missing CAS outputs",
+                            action_and_blobs.action,
+                        ),
+                        true,
+                    ),
+                );
+            }
+        };
         res.action_result = Some(response.execute_response.action_result);
 
         if let Some(run_action_key) = request.run_action_key()

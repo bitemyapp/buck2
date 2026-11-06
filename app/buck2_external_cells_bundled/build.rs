@@ -51,7 +51,7 @@ fn write_include_file(prelude: &Path, mut include_file: impl io::Write) -> io::R
         "pub(crate) const DATA: &[crate::BundledFile] = &["
     )?;
 
-    for res in walkdir::WalkDir::new(prelude) {
+    for res in walkdir::WalkDir::new(prelude).sort_by_file_name() {
         let entry = res.map_err(|e| e.into_io_error().unwrap())?;
         if !entry.file_type().is_file() {
             continue;

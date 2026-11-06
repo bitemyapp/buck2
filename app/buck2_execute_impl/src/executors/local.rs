@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -110,11 +110,17 @@ use host_sharing::host_sharing::HostSharingGuard;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::info;
 
+use crate::executors::caching::CacheUploader;
+#[cfg(target_os = "linux")]
+use crate::executors::output_pipeline::OutputPipeline as PipelineGuard;
 use crate::executors::worker::WorkerHandle;
 use crate::executors::worker::WorkerPool;
 use crate::incremental_actions_helper::get_incremental_path_map;
 use crate::incremental_actions_helper::save_content_based_incremental_state;
 use crate::sqlite::incremental_state_db::IncrementalDbState;
+
+#[cfg(not(target_os = "linux"))]
+type PipelineGuard = ();
 
 #[derive(Debug, buck2_error::Error)]
 #[buck2(input)]
@@ -150,6 +156,7 @@ pub struct LocalExecutor {
     /// Attributed with the CAS traffic that materializing this executor's inputs causes. The
     /// buck2 invocation's, not that of any RE work the action's configuration involves.
     invocation_re_use_case: RemoteExecutorUseCase,
+    cache_uploader: Option<Arc<CacheUploader>>,
 }
 
 impl LocalExecutor {
@@ -180,7 +187,67 @@ impl LocalExecutor {
             memory_tracker,
             daemon_id,
             invocation_re_use_case,
+            cache_uploader: None,
         }
+    }
+
+    pub fn with_cache_uploader(mut self, uploader: Option<Arc<CacheUploader>>) -> Self {
+        self.cache_uploader = uploader;
+        self
+    }
+
+    async fn start_output_pipeline(
+        &self,
+        request: &CommandExecutionRequest,
+        digest_config: DigestConfig,
+    ) -> Option<PipelineGuard> {
+        #[cfg(target_os = "linux")]
+        {
+            let client = if request.pipeline_cache_upload() {
+                if let Some(uploader) = self.cache_uploader.as_ref() {
+                    match uploader.output_pipeline_client(digest_config).await {
+                        Ok(client) => client,
+                        Err(error) => {
+                            tracing::debug!(%error, "Speculative CAS upload unavailable");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if client.is_none() && !crate::materializers::local_content_store::enabled() {
+                return None;
+            }
+            let outputs = request
+                .outputs()
+                .map(|output| {
+                    let path = output
+                        .resolve(
+                            &self.artifact_fs,
+                            Some(&ContentBasedPathHash::for_output_artifact()),
+                        )?
+                        .into_path();
+                    Ok(self.root.join(&path).as_path().to_path_buf())
+                })
+                .collect::<buck2_error::Result<Vec<_>>>();
+            match outputs {
+                Ok(outputs) => {
+                    match PipelineGuard::new(self.root.as_path(), outputs, client, digest_config) {
+                        Ok(pipeline) => return pipeline,
+                        Err(error) => {
+                            tracing::debug!(%error, "Speculative output pipeline unavailable")
+                        }
+                    }
+                }
+                Err(error) => tracing::debug!(%error, "Speculative output roots unavailable"),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (request, digest_config);
+        None
     }
 
     // Compiler gets confused (on the not(unix) branch only, weirdly) if you use an async fn.
@@ -280,7 +347,7 @@ impl LocalExecutor {
         request: &CommandExecutionRequest,
         manager: CommandExecutionManagerWithClaim,
         cancellations: &CancellationContext,
-        liveliness_observer: impl LivelinessObserver + 'static,
+        liveliness_observer: impl LivelinessObserver + Dupe + 'static,
         scratch_path: &ScratchPath,
         args: &[String],
         worker: Option<&WorkerHandle>,
@@ -288,12 +355,14 @@ impl LocalExecutor {
         cgroup: Option<CgroupPathBuf>,
         freeze_rx: impl ActionFreezeEventReceiver,
         network_access: Option<NetworkAccess>,
+        digest_config: DigestConfig,
     ) -> Result<
         (
             TimeSpan,
             SystemTime,
             CommandResult,
             CommandExecutionManagerWithClaim,
+            Option<PipelineGuard>,
         ),
         CommandExecutionResult,
     > {
@@ -321,6 +390,15 @@ impl LocalExecutor {
         {
             return Err(manager.error("prepare_output_dirs_failed", e));
         };
+
+        let mut pipeline = tokio::select! {
+            pipeline = self.start_output_pipeline(request, digest_config) => pipeline,
+            _ = liveliness_observer.while_alive() => None,
+        };
+        #[cfg(target_os = "linux")]
+        let pipeline_liveliness = pipeline.as_ref().map(|_| liveliness_observer.dupe());
+        #[cfg(target_os = "linux")]
+        let pipeline_execution = &mut pipeline;
 
         let (time_span, start_time, res) = executor_stage_async(
             {
@@ -359,8 +437,9 @@ impl LocalExecutor {
                 let execution_start = TimeSpan::start_now();
                 let start_time = SystemTime::now();
 
+                let producer = async move {
                 let env = env.iter().map(|(k, v)| (k, v.into_os_str()));
-                let r = if let Some(worker) = worker {
+                if let Some(worker) = worker {
                     let env: Vec<(OsString, OsString)> = env
                         .into_iter()
                         .map(|(k, v)| (OsString::from(k), v.to_owned()))
@@ -383,7 +462,15 @@ impl LocalExecutor {
                         network_access,
                     )
                     .await
+                }
                 };
+                #[cfg(target_os = "linux")]
+                let r = match pipeline_execution.as_mut() {
+                    Some(pipeline) => pipeline.run(producer).await,
+                    None => producer.await,
+                };
+                #[cfg(not(target_os = "linux"))]
+                let r = producer.await;
 
                 let time_span = execution_start.end_now();
 
@@ -393,8 +480,26 @@ impl LocalExecutor {
         .boxed()
         .await;
 
+        #[cfg(target_os = "linux")]
+        if let Some(pipeline) = pipeline.as_mut() {
+            let successful = res.as_ref().is_ok_and(|result| {
+                matches!(
+                    result.status,
+                    GatherOutputStatus::Finished { exit_code: 0, .. }
+                )
+            });
+            pipeline
+                .finish(
+                    successful,
+                    pipeline_liveliness
+                        .expect("active output pipeline")
+                        .while_alive(),
+                )
+                .await;
+        }
+
         match res {
-            Ok(res) => Ok((time_span, start_time, res, manager)),
+            Ok(res) => Ok((time_span, start_time, res, manager, pipeline)),
             Err(e) => Err(manager.error("exec_failed", e)),
         }
     }
@@ -412,12 +517,14 @@ impl LocalExecutor {
         worker: Option<&WorkerHandle>,
         env: &[(&str, StrOrOsStr<'_>)],
         network_access: Option<NetworkAccess>,
+        digest_config: DigestConfig,
     ) -> Result<
         (
             TimeSpan,
             SystemTime,
             CommandResult,
             CommandExecutionManagerWithClaim,
+            Option<PipelineGuard>,
         ),
         CommandExecutionResult,
     > {
@@ -501,11 +608,12 @@ impl LocalExecutor {
                     cgroup_session.as_ref().map(|s| s.path.clone()),
                     freeze_rx,
                     network_access,
+                    digest_config,
                 )
                 .await;
 
             let res = match res {
-                Ok((time_span, start_time, status, res_manager)) => {
+                Ok((time_span, start_time, status, res_manager, pipeline)) => {
                     if matches!(status.status, GatherOutputStatus::Cancelled) {
                         let f = retry_future.lock().unwrap().take();
                         if let Some(retry_future) = f {
@@ -514,7 +622,7 @@ impl LocalExecutor {
                             continue;
                         }
                     }
-                    Ok((time_span, start_time, status, res_manager))
+                    Ok((time_span, start_time, status, res_manager, pipeline))
                 }
                 Err(e) => Err(e),
             };
@@ -701,7 +809,7 @@ impl LocalExecutor {
             },
         };
 
-        let (time_span, start_time, res, manager) = match self
+        let (time_span, start_time, res, manager, _pipeline) = match self
             .exec_with_resource_control(
                 action_digest,
                 request,
@@ -713,6 +821,7 @@ impl LocalExecutor {
                 worker.as_deref(),
                 &env,
                 network_access,
+                digest_config,
             )
             .await
         {
@@ -1008,7 +1117,7 @@ impl LocalExecutor {
                         buck2_data::LocalStage {
                             stage: Some(buck2_data::WorkerQueued {}.into()),
                         },
-                        broker.acquire(&HostSharingRequirements::default()),
+                        broker.acquire(&HostSharingRequirements::default(), 0),
                     )
                     .await,
                 )
@@ -1239,7 +1348,7 @@ impl PreparedCommandExecutor for LocalExecutor {
                 stage: Some(buck2_data::LocalQueued {}.into()),
             },
             self.host_sharing_broker
-                .acquire(request.host_sharing_requirements()),
+                .acquire(request.host_sharing_requirements(), request.priority()),
         )
         .await;
         manager.start_waiting_category(WaitingCategory::Unknown);

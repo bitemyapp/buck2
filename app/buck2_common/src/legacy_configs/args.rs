@@ -106,9 +106,9 @@ fn resolve_config_flag_arg(
 ) -> buck2_error::Result<ResolvedConfigFlag> {
     let (raw_section_and_key, raw_value) = raw_arg
         .split_once('=')
-        .ok_or_else(|| ConfigArgumentParseError::NoEqualsSeparator(raw_arg.to_owned()))?;
+        .ok_or(ConfigArgumentParseError::NoEqualsSeparator)?;
     let ConfigSectionAndKey { section, key } =
-        parse_config_section_and_key(raw_section_and_key, Some(raw_arg))?;
+        parse_config_section_and_key(raw_section_and_key)?;
 
     let value = match raw_value {
         "" => None, // An empty string unsets this config.
@@ -229,6 +229,20 @@ pub(crate) fn to_proto_config_args(
 #[cfg(test)]
 mod tests {
     use super::resolve_config_flag_arg;
+
+    #[test]
+    fn malformed_config_arguments_do_not_echo_values() {
+        for argument in [
+            "buck2_re_client. http_headers=synthetic-invalid-credential",
+            "buck2_re_client.=synthetic-invalid-credential",
+            "http_headers=synthetic-invalid-credential",
+            "synthetic-invalid-credential",
+            "synthetic-invalid-credential==",
+        ] {
+            let error = resolve_config_flag_arg(None, argument).unwrap_err();
+            assert!(!format!("{error:#}").contains("synthetic-invalid-credential"));
+        }
+    }
 
     #[test]
     fn test_argument_pair() -> buck2_error::Result<()> {

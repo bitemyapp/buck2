@@ -22,6 +22,7 @@ use buck2_certs::validate::CertState;
 use buck2_cli_proto::client_context::ExitWhen;
 use buck2_cli_proto::client_context::PreemptibleWhen;
 use buck2_common::legacy_configs::dice::HasInjectedLegacyConfigs;
+use buck2_common::legacy_configs::telemetry::redact_buckconfig_input_values;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::pattern::pattern::ParsedPattern;
@@ -179,10 +180,13 @@ impl CommandTransactionObserver for BuckconfigTelemetry<'_> {
         self.events.instant_event(buck2_data::TagEvent {
             tags: get_experiment_tags(&current_external_and_local_configs),
         });
-        self.events
-            .instant_event(buck2_data::BuckconfigInputValues {
-                components: current_external_and_local_configs,
-            });
+        let mut config_event = buck2_data::BuckconfigInputValues {
+            components: current_external_and_local_configs,
+        };
+        // Keep execution and mismatch detection on real values; only the event
+        // copy is redacted, before any native event sink can serialize it.
+        redact_buckconfig_input_values(&mut config_event);
+        self.events.instant_event(config_event);
 
         Ok(())
     }
@@ -389,5 +393,73 @@ impl ServerCommandDiceContext for dyn ServerCommandContextTrait + '_ {
                 )
             })
             .await?
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use buck2_events::Event;
+    use buck2_events::EventSink;
+    use buck2_events::daemon_id::DaemonId;
+
+    use super::*;
+
+    struct CountEvents(Arc<AtomicUsize>);
+
+    impl EventSink for CountEvents {
+        fn send(&self, _event: Event) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn redaction_keeps_private_config_comparisons_exact() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let dispatcher = EventDispatcher::new(
+            TraceId::null(),
+            DaemonId::null(),
+            CountEvents(count.clone()),
+        );
+        let mut previous = PreviousCommandData::default();
+        for (value, expected_mismatches) in [
+            ("synthetic-first-credential", 0),
+            ("synthetic-first-credential", 0),
+            ("synthetic-rotated-credential", 1),
+        ] {
+            let mut event = buck2_data::BuckconfigInputValues {
+                components: vec![buck2_data::BuckconfigComponent {
+                    data: Some(buck2_data::buckconfig_component::Data::ConfigValue(
+                        buck2_data::ConfigValue {
+                            section: "ordinary".to_owned(),
+                            key: "choice".to_owned(),
+                            value: value.to_owned(),
+                            ..Default::default()
+                        },
+                    )),
+                }],
+            };
+            // This is the observer's ordering: compare/store real values first,
+            // then redact only the separate native event payload.
+            previous.process_current_command(
+                dispatcher.dupe(),
+                event.components.clone(),
+                Vec::new(),
+                TraceId::null(),
+            );
+            redact_buckconfig_input_values(&mut event);
+            assert_eq!(count.load(Ordering::Relaxed), expected_mismatches);
+            let stored = &previous.data.as_ref().unwrap().external_and_local_configs[0];
+            let Some(buck2_data::buckconfig_component::Data::ConfigValue(stored)) = &stored.data else {
+                panic!("missing stored config");
+            };
+            assert_eq!(stored.value, value);
+            let Some(buck2_data::buckconfig_component::Data::ConfigValue(logged)) = &event.components[0].data else {
+                panic!("missing event config");
+            };
+            assert_eq!(logged.value, "<redacted>");
+        }
     }
 }

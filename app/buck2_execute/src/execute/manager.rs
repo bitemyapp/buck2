@@ -55,6 +55,9 @@ pub struct CommandExecutionManagerInner {
     pub events: EventDispatcher,
     pub liveliness_observer: Arc<dyn LivelinessObserver>,
     pub intend_to_fallback_on_failure: bool,
+    /// A cached result referenced missing CAS content. Do not let Execute serve
+    /// that same record again after the cache checker rejected it.
+    pub remote_action_cache_rejected: bool,
     pub execution_kind: Option<CommandExecutionKind>,
     pub was_result_delayed: Arc<AtomicBool>,
     pub waiting_data: WaitingData,
@@ -78,6 +81,7 @@ impl CommandExecutionManager {
                 events,
                 liveliness_observer,
                 intend_to_fallback_on_failure: false,
+                remote_action_cache_rejected: false,
                 execution_kind: None,
                 was_result_delayed: Arc::new(AtomicBool::new(false)),
                 waiting_data,
@@ -92,6 +96,7 @@ impl CommandExecutionManager {
             events,
             liveliness_observer,
             intend_to_fallback_on_failure: _,
+            remote_action_cache_rejected: _,
             execution_kind,
             was_result_delayed: _,
             waiting_data,
@@ -140,6 +145,11 @@ impl CommandExecutionManager {
         intend_to_fallback_on_failure: bool,
     ) -> Self {
         self.inner.intend_to_fallback_on_failure = intend_to_fallback_on_failure;
+        self
+    }
+
+    pub fn with_remote_action_cache_rejected(mut self, rejected: bool) -> Self {
+        self.inner.remote_action_cache_rejected = rejected;
         self
     }
 

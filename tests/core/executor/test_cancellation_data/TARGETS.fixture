@@ -1,9 +1,16 @@
-load(":defs.bzl", "slow_actions")
+load(":defs.bzl", "priority_actions", "slow_actions")
 
 slow_actions(
     name = "slow",
-    pids = read_config("test", "pids"),
-    duration = read_config("test", "duration"),
+    pids = read_config("test", "pids", ""),
+    duration = read_config("test", "duration", "60"),
     count = 10,
     src = "slow.py",
+)
+
+priority_actions(
+    name = "priority",
+    python = read_config("test", "python", "fbpython"),
+    state = read_config("test", "state", ""),
+    src = "priority.py",
 )

@@ -320,6 +320,13 @@ pub async fn write_to_disk<'a>(
                     );
 
                     maybe_locked_write(fs, &path, &content, is_executable, path_kind)?;
+                    crate::materializers::local_content_store::file(
+                        &fs.resolve(&path),
+                        digest.data(),
+                        is_executable,
+                        digest_config,
+                        true,
+                    )?;
 
                     values.push(ArtifactValue::file(FileMetadata {
                         digest,
@@ -340,6 +347,7 @@ pub async fn cas_download(
     info: &CasDownloadInfo,
     artifacts: Vec<(ProjectRelativePathBuf, ArtifactValue)>,
     cancellations: &CancellationContext,
+    digest_config: DigestConfig,
 ) -> buck2_error::Result<()> {
     io.execute_io(
         Box::new(CleanOutputPaths {
@@ -363,25 +371,42 @@ pub async fn cas_download(
         .await?;
     }
 
-    let mut files = Vec::new();
-    for (path, value) in artifacts.iter() {
-        let mut walk = unordered_entry_walk(value.entry().as_ref().map_dir(Directory::as_ref));
-        while let Some((entry_path, entry)) = walk.next() {
-            if let DirectoryEntry::Leaf(ActionDirectoryMember::File(m)) = entry {
-                files.push(NamedDigestWithPermissions {
-                    named_digest: NamedDigest {
-                        digest: m.digest.to_re(),
-                        name: fs
-                            .resolve(path.join(entry_path.get()))
-                            .as_maybe_relativized_str()?
-                            .to_owned(),
-                        ..Default::default()
-                    },
-                    is_executable: m.is_executable,
-                    ..Default::default()
-                });
+    let (files, missing) = io
+        .execute_io_inline(|| {
+            let mut files = Vec::new();
+            let mut missing = Vec::new();
+            for (path, value) in &artifacts {
+                let mut walk =
+                    unordered_entry_walk(value.entry().as_ref().map_dir(Directory::as_ref));
+                while let Some((entry_path, entry)) = walk.next() {
+                    if let DirectoryEntry::Leaf(ActionDirectoryMember::File(m)) = entry {
+                        let Some(download) =
+                            crate::materializers::local_content_store::Download::prepare(
+                                fs.resolve(path.join(entry_path.get())),
+                                m.dupe(),
+                                digest_config,
+                            )?
+                        else {
+                            continue;
+                        };
+                        files.push(NamedDigestWithPermissions {
+                            named_digest: NamedDigest {
+                                digest: m.digest.to_re(),
+                                name: download.name()?,
+                                ..Default::default()
+                            },
+                            is_executable: m.is_executable,
+                            ..Default::default()
+                        });
+                        missing.push(download);
+                    }
+                }
             }
-        }
+            buck2_error::Ok((files, missing))
+        })
+        .await?;
+    if files.is_empty() {
+        return Ok(());
     }
 
     let re_conn = re.get_re_connection();
@@ -389,6 +414,13 @@ pub async fn cas_download(
     cancellations
         .critical_section(|| re_client.materialize_files(files, info))
         .await?;
+    io.execute_io_inline(|| {
+        for download in missing {
+            download.finish(digest_config)?;
+        }
+        buck2_error::Ok(())
+    })
+    .await?;
     Ok(())
 }
 

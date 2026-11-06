@@ -435,6 +435,23 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
         _lease: &WriteLease,
         artifacts: Vec<DeclareArtifactPayload>,
     ) -> buck2_error::Result<()> {
+        let artifacts = if crate::materializers::local_content_store::enabled() {
+            let fs = self.io.fs().clone();
+            let digest_config = self.io.digest_config();
+            tokio::task::spawn_blocking(move || {
+                for artifact in &artifacts {
+                    crate::materializers::local_content_store::artifact(
+                        &fs.resolve(&artifact.path),
+                        artifact.artifact.entry(),
+                        digest_config,
+                    )?;
+                }
+                buck2_error::Ok(artifacts)
+            })
+            .await??
+        } else {
+            artifacts
+        };
         let cmd =
             MaterializerCommand::DeclareExisting(artifacts, current_span(), get_dispatcher_opt());
         self.command_sender.send(cmd)?;

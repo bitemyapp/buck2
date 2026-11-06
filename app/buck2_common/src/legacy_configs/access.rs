@@ -13,31 +13,24 @@ use std::sync::Arc;
 
 use buck2_error::BuckErrorContext;
 use buck2_hash::StdBuckHashMap;
-use buck2_util::env_vars::substitute_env_vars;
 
 use crate::legacy_configs::configs::ConfigValue;
 use crate::legacy_configs::configs::LegacyBuckConfig;
 use crate::legacy_configs::configs::LegacyBuckConfigSection;
 use crate::legacy_configs::configs::LegacyBuckConfigValue;
 use crate::legacy_configs::key::BuckconfigKeyRef;
+use crate::legacy_configs::telemetry::REDACTED_CONFIG_VALUE;
 use crate::legacy_configs::view::LegacyBuckConfigView;
 
-/// Read the `[buck2_metadata]` section from a `LegacyBuckConfig` and resolve any `$VAR`
-/// references. Entries whose env vars are not set are skipped with a warning.
+/// Record `[buck2_metadata]` keys only. Values may resolve arbitrary credential
+/// aliases or environment variables and must not enter command event metadata.
 pub fn parse_buckconfig_metadata(config: &LegacyBuckConfig) -> StdBuckHashMap<String, String> {
     let mut map = StdBuckHashMap::default();
     let Some(section) = config.get_section("buck2_metadata") else {
         return map;
     };
-    for (key, value) in section.iter() {
-        match substitute_env_vars(value.as_str()) {
-            Ok(resolved) => {
-                map.insert(key.to_owned(), resolved);
-            }
-            Err(e) => {
-                tracing::warn!("Skipping [buck2_metadata] key `{}`: {:#}", key, e);
-            }
-        }
+    for key in section.keys() {
+        map.insert(key.to_owned(), REDACTED_CONFIG_VALUE.to_owned());
     }
     map
 }
@@ -107,19 +100,17 @@ impl LegacyBuckConfig {
     where
         buck2_error::Error: From<<T as FromStr>::Err>,
     {
-        let BuckconfigKeyRef { section, property } = key;
-        value
-            .parse()
-            .map_err(buck2_error::Error::from)
-            .with_buck_error_context(|| {
-                format!(
-                    "Invalid value for buckconfig `{}.{}`: conversion to {} failed, value as `{}`",
-                    section.to_owned(),
-                    property.to_owned(),
-                    std::any::type_name::<T>(),
-                    value.to_owned(),
-                )
-            })
+        value.parse().map_err(|error| {
+            let error = buck2_error::Error::from(error);
+            // FromStr diagnostics can embed their input too. Preserve failure
+            // classification, key and target type, but not that error chain.
+            buck2_error::buck2_error!(
+                error.best_tag().unwrap_or(buck2_error::ErrorTag::Input),
+                "Invalid value for buckconfig `{key}`: conversion to {} failed, value and parser diagnostic {REDACTED_CONFIG_VALUE}",
+                std::any::type_name::<T>(),
+            )
+            .tag(error.tags())
+        })
     }
 
     pub fn parse<T: FromStr>(&self, key: BuckconfigKeyRef) -> buck2_error::Result<Option<T>>

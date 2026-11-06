@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::path::Path;
 use std::str::FromStr;
@@ -31,6 +31,7 @@ use buck2_hash::BuckMutSet;
 use buck2_hash::IntentionallyStdHashMap;
 use dupe::Dupe;
 use itertools::Itertools;
+#[cfg(fbcode_build)]
 use jiff::SignedDuration;
 use remote_execution::InlinedBlobWithDigest;
 use remote_execution::NamedDigest;
@@ -47,6 +48,7 @@ use crate::directory::ActionImmutableDirectory;
 use crate::directory::ReDirectorySerializer;
 use crate::execute::blobs::ActionBlobs;
 use crate::materialize::materializer::ArtifactNotMaterializedReason;
+#[cfg(fbcode_build)]
 use crate::materialize::materializer::CasDownloadInfo;
 use crate::materialize::materializer::MaterializationPurpose;
 use crate::materialize::materializer::MaterializeRequest;
@@ -71,6 +73,7 @@ impl Uploader {
         input_dir: &'a ActionImmutableDirectory,
         blobs: &'a ActionBlobs,
         use_case: RemoteExecutorUseCase,
+        negative_cache: NegativeCache,
     ) -> buck2_error::Result<(
         Vec<InlinedBlobWithDigest>,
         BuckMutSet<&'a TrackedFileDigest>,
@@ -101,7 +104,7 @@ impl Uploader {
                     .iter()
                     .map(|digest| (*digest).dupe())
                     .collect(),
-                NegativeCache::Allowed,
+                negative_cache,
             )
             .await?;
 
@@ -144,9 +147,10 @@ impl Uploader {
         blobs: &ActionBlobs,
         use_case: RemoteExecutorUseCase,
         identity: Option<&ReActionIdentity<'_>>,
+        negative_cache: NegativeCache,
     ) -> buck2_error::Result<UploadStats> {
         let (mut upload_blobs, mut missing_digests) =
-            Self::find_missing(client, input_dir, blobs, use_case).await?;
+            Self::find_missing(client, input_dir, blobs, use_case, negative_cache).await?;
 
         if upload_blobs.is_empty() && missing_digests.is_empty() {
             return Ok(UploadStats::default());
@@ -231,48 +235,60 @@ impl Uploader {
                         if let DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) =
                             entry.as_ref()
                         {
-                            // NOTE: find_missing has negative caching, so when we query to know if an
-                            // artifact was uploaded, if it was the result of an action we just ran, it
-                            // won't be here. On the flip side, if a digest has been in the CAS for
-                            // a very long time, it might have expired.
                             if file.digest.to_re() == digest {
-                                if should_error_for_missing_digest(info) {
+                                #[cfg(fbcode_build)]
+                                let missing = should_error_for_missing_digest(info);
+                                #[cfg(not(fbcode_build))]
+                                let missing = client
+                                    .get_digests_ttl(
+                                        vec![digest.clone()],
+                                        &use_case.metadata(identity),
+                                        false,
+                                    )
+                                    .await?
+                                    .digests_with_ttl
+                                    .iter()
+                                    .any(|digest| digest.ttl <= 0);
+
+                                if !missing {
+                                    #[cfg(fbcode_build)]
                                     soft_error!(
-                                        "cas_missing_fatal",
+                                        "cas_missing",
                                         buck2_error::buck2_error!(
                                             buck2_error::ErrorTag::Input,
-                                            "{} missing (origin: {})",
+                                            "{} (expires = {}) is missing in the CAS but expected to exist as per: {:#}",
                                             file.digest,
-                                            info.origin.as_display_for_not_found(),
+                                            file.digest.expires()?,
+                                            err
                                         ),
-                                        daemon_in_memory_state_is_corrupted: true,
-                                        action_cache_is_corrupted: info.origin.guaranteed_by_action_cache()
+                                        quiet: true
                                     )?;
-
-                                    return Err(buck2_error::buck2_error!(
-                                        buck2_error::ErrorTag::ReCasArtifactExpired,
-                                        "Your build requires an artifact that has expired in the RE CAS \
-                                        and Buck does not have it. This likely happened because your Buck daemon \
-                                        has been online for a long time. This error is currently unrecoverable. \
-                                        To proceed, you should restart Buck using `buck2 killall`. \
-                                        Debug information: {:#}",
-                                        err
-                                    ));
+                                    continue;
                                 }
 
+                                // A fresh REAPI miss is authoritative even for
+                                // a recently produced artifact. Its bytes are
+                                // remote-only, so retrying upload cannot repair
+                                // it: discard stale action state and rebuild.
                                 soft_error!(
-                                    "cas_missing",
+                                    "cas_missing_fatal",
                                     buck2_error::buck2_error!(
                                         buck2_error::ErrorTag::Input,
-                                        "{} (expires = {}) is missing in the CAS but expected to exist as per: {:#}",
+                                        "{} missing (origin: {})",
                                         file.digest,
-                                        file.digest.expires()?,
-                                        err
+                                        info.origin.as_display_for_not_found(),
                                     ),
-                                    quiet: true
+                                    daemon_in_memory_state_is_corrupted: true,
+                                    action_cache_is_corrupted: info.origin.guaranteed_by_action_cache()
                                 )?;
 
-                                continue;
+                                return Err(buck2_error::buck2_error!(
+                                    buck2_error::ErrorTag::ReCasArtifactExpired,
+                                    "Your build requires an artifact missing from the RE CAS \
+                                    with no local copy. Native CAS recovery will restart the \
+                                    command when enabled. Debug information: {:#}",
+                                    err
+                                ));
                             }
                         }
 
@@ -388,16 +404,17 @@ impl Uploader {
 #[cfg(fbcode_build)] // Relies on fbcode future sizes
 buck2_util::size_assert::words_of_async_fn_future!(
     Uploader::upload,
-    (_, _, _, _, _, _, _, _),
+    (_, _, _, _, _, _, _, _, _),
     ~287
 );
 #[cfg(fbcode_build)] // Relies on fbcode future sizes
 buck2_util::size_assert::words_of_async_fn_future!(
     Uploader::find_missing,
-    (_, _, _, _),
+    (_, _, _, _, _),
     ~65
 );
 
+#[cfg(fbcode_build)]
 fn should_error_for_missing_digest(info: &CasDownloadInfo) -> bool {
     // RE sometimes reports things that exist as missing. We don't fully understand why at this
     // time and this is being investigated, but we know that RE normally ensures that anything it

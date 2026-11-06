@@ -21,8 +21,10 @@ use buck2_events::dispatch::current_span;
 use buck2_events::dispatch::span_async_simple;
 use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::materialize::materializer::HasMaterializer;
+use buck2_execute::materialize::materializer::MaterializationError;
 use buck2_execute::materialize::materializer::MaterializationPurpose;
 use buck2_execute::materialize::materializer::MaterializeRequest;
+use buck2_execute::re::error::report_cas_corruption;
 use buck2_util::time_span::TimeSpan;
 use dice::DiceComputations;
 use dice::DiceComputationsData;
@@ -87,7 +89,17 @@ impl ArtifactMaterializer for DiceComputationsData {
                     drop(
                         response
                             .ensure_results_ok()
-                            .map_err(Into::<buck2_error::Error>::into)?,
+                            .map_err(|error| match error {
+                                MaterializationError::NotFound { source } => {
+                                    let corrupted =
+                                        source.info.origin.guaranteed_by_action_cache();
+                                    report_cas_corruption(
+                                        MaterializationError::NotFound { source }.into(),
+                                        corrupted,
+                                    )
+                                }
+                                error => error.into(),
+                            })?,
                     );
                 };
 

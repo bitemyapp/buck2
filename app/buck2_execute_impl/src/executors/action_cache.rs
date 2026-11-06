@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -141,6 +141,7 @@ async fn query_action_cache_and_download_result(
                 ProjectRelativePath::empty(),
                 request.paths().input_directory(),
                 identity,
+                buck2_execute::re::presence::NegativeCache::Allowed,
             )
             .await
         {
@@ -227,7 +228,12 @@ async fn query_action_cache_and_download_result(
     )
     .await;
 
-    let DownloadResult::Result(mut res) = res;
+    let mut res = match res {
+        DownloadResult::Result(res) => res,
+        DownloadResult::CacheMiss(manager) => {
+            return ControlFlow::Continue(manager.with_remote_action_cache_rejected(true));
+        }
+    };
     match &cache_type {
         CacheType::RemoteDepFileCache(key) => {
             tracing::trace!(

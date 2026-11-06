@@ -10,6 +10,7 @@
 
 #![deny(unused_crate_dependencies)]
 mod named_semaphores;
+mod priority_semaphore;
 pub use named_semaphores::NamedSemaphores;
 
 pub mod host_sharing;

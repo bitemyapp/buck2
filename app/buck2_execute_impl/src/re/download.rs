@@ -22,17 +22,22 @@ use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::buck_out_path::BuildArtifactPath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+use buck2_directory::directory::directory::Directory;
+use buck2_directory::directory::directory_iterator::DirectoryIterator;
 use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_error::BuckErrorContext;
 use buck2_events::dispatch::console_message;
 use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::digest::CasDigestFromReExt;
+use buck2_execute::digest::CasDigestToReExt;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::directory::ActionDirectoryMember;
 use buck2_execute::directory::extract_artifact_value;
 use buck2_execute::directory::re_tree_to_directory;
 use buck2_execute::execute::executor_stage_async;
+use buck2_execute::execute::kind::CommandExecutionKind;
 use buck2_execute::execute::kind::RemoteCommandExecutionDetails;
+use buck2_execute::execute::kind::RemoteExecutionOrigin;
 use buck2_execute::execute::manager::CommandExecutionManager;
 use buck2_execute::execute::manager::CommandExecutionManagerExt;
 use buck2_execute::execute::manager::CommandExecutionManagerWithClaim;
@@ -51,6 +56,7 @@ use buck2_execute::materialize::materializer::MaterializeRequest;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::action_identity::ReActionIdentity;
 use buck2_execute::re::error::RemoteExecutionError;
+use buck2_execute::re::error::report_cas_corruption;
 use buck2_execute::re::manager::ManagedRemoteExecutionClient;
 use buck2_execute::re::output_trees_download_config::OutputTreesDownloadConfig;
 use buck2_execute::re::remote_action_result::RemoteActionResult;
@@ -322,7 +328,18 @@ impl CasDownloader<'_> {
             BuckIndexMap<CommandExecutionOutput, ArtifactValue>,
         ),
     > {
-        let manager = manager.with_execution_kind(output_spec.execution_kind(details.clone()));
+        let execution_kind = output_spec.execution_kind(details.clone());
+        let validate_cached_outputs = cfg!(not(fbcode_build))
+            && matches!(
+                &execution_kind,
+                CommandExecutionKind::ActionCache { .. }
+                    | CommandExecutionKind::RemoteDepFileCache { .. }
+                    | CommandExecutionKind::Remote {
+                        origin: RemoteExecutionOrigin::ServedFromCache,
+                        ..
+                    }
+            );
+        let manager = manager.with_execution_kind(execution_kind);
         executor_stage_async(stage, async {
             let now = Timestamp::now();
             let expires = re_expiration_from_ttl(now, output_spec.ttl(), &identity.action_key);
@@ -344,12 +361,14 @@ impl CasDownloader<'_> {
                     output_spec,
                     expires,
                     &info,
+                    validate_cached_outputs,
                 )
                 .await;
 
             let artifacts =
                 match artifacts {
-                    Ok(artifacts) => artifacts,
+                    Ok(Some(artifacts)) => artifacts,
+                    Ok(None) => return ControlFlow::Break(DownloadResult::CacheMiss(manager)),
                     Err(e) => {
                         let error: buck2_error::Error =
                             e.context(format!("action_digest={}", details.action_digest));
@@ -417,7 +436,8 @@ impl CasDownloader<'_> {
         output_spec: &dyn RemoteActionResult,
         expires: Timestamp,
         info: &CasDownloadInfo,
-    ) -> buck2_error::Result<ExtractedArtifacts> {
+        validate_cached_outputs: bool,
+    ) -> buck2_error::Result<Option<ExtractedArtifacts>> {
         // Download process:
         // 1. merges all the outputs (files and trees) into the inputs structure
         // 2. computes the ArtifactValue for all outputs from that merged structure
@@ -425,8 +445,22 @@ impl CasDownloader<'_> {
         let input_dir = paths.input_directory();
         let output_paths = paths.output_paths();
         let mut input_dir = input_dir.clone().into_builder();
+        let mut output_digests = BuckMutSet::default();
+        if validate_cached_outputs {
+            output_digests.extend(
+                output_spec
+                    .std_stream_digests()
+                    .into_iter()
+                    .flatten()
+                    .filter(|digest| digest.size_in_bytes != 0)
+                    .cloned(),
+            );
+        }
 
         for x in output_spec.output_files() {
+            if validate_cached_outputs && x.digest.digest.size_in_bytes != 0 {
+                output_digests.insert(x.digest.digest.clone());
+            }
             let digest = FileDigest::from_re(&x.digest.digest, self.digest_config)?;
             let digest = TrackedFileDigest::new_expires(
                 digest,
@@ -473,7 +507,7 @@ impl CasDownloader<'_> {
 
             // Compute the re_outputs from the output_directories
             // This requires traversing the trees to find symlinks that point outside such trees
-            let trees = self
+            let trees = match self
                 .re_client
                 .download_typed_blobs::<RE::Tree>(
                     Some(identity),
@@ -486,7 +520,23 @@ impl CasDownloader<'_> {
                 )
                 .boxed()
                 .await
-                .buck_error_context("Failed to download trees")?;
+            {
+                Ok(trees) => trees,
+                Err(error) => {
+                    let missing = error
+                        .find_typed_context::<RemoteExecutionError>()
+                        .is_some_and(|error| error.code == RE::TCode::NOT_FOUND);
+                    if missing && validate_cached_outputs {
+                        return Ok(None);
+                    }
+                    let error = error.context("Failed to download trees");
+                    return Err(if missing {
+                        report_cas_corruption(error, true)
+                    } else {
+                        error
+                    });
+                }
+            };
 
             for (dir, tree) in output_spec.output_directories().iter().zip(trees) {
                 let entry = re_tree_to_directory(
@@ -496,10 +546,34 @@ impl CasDownloader<'_> {
                     self.output_trees_download_config
                         .fingerprint_re_output_trees_eagerly(),
                 )?;
+                if validate_cached_outputs {
+                    for child in entry.unordered_walk().without_paths() {
+                        if let DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) = child
+                            && file.digest.size() != 0
+                        {
+                            output_digests.insert(file.digest.to_re());
+                        }
+                    }
+                }
                 input_dir.insert(
                     re_forward_path(dir.path.as_str())?,
                     DirectoryEntry::Dir(entry),
                 )?;
+            }
+        }
+
+        if validate_cached_outputs && !output_digests.is_empty() {
+            // REAPI does not lease cached outputs. This direct query bypasses
+            // both interned digest expirations and the OSS FindMissing cache.
+            // Trees were already fetched above; only leaf bytes and non-inline
+            // standard streams need a presence query, not eager materialization.
+            let expirations = self
+                .re_client
+                .get_digest_expirations(output_digests.into_iter().collect(), info)
+                .await?;
+            let now = Timestamp::now();
+            if expirations.iter().any(|(_, expires)| *expires <= now) {
+                return Ok(None);
             }
         }
 
@@ -528,10 +602,10 @@ impl CasDownloader<'_> {
             }
         }
 
-        Ok(ExtractedArtifacts {
+        Ok(Some(ExtractedArtifacts {
             to_declare,
             mapped_outputs,
-        })
+        }))
     }
 
     async fn materialize_outputs(
@@ -569,6 +643,9 @@ pub enum DownloadResult {
     /// Got a result: might be a success, might be a failure. Caller needs to deal with this
     /// result.
     Result(CommandExecutionResult),
+    /// A cache record refers to evicted CAS content. No output claim or
+    /// materializer declaration has been made; the producer can execute.
+    CacheMiss(CommandExecutionManager),
 }
 
 impl FromResidual<ControlFlow<Self, Infallible>> for DownloadResult {

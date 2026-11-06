@@ -553,6 +553,7 @@ impl<'a> BuckArgMatches<'a> {
         use buck2_common::argv::ConfigFlagValue;
         use buck2_common::argv::get_flagfile_for_logging;
         use buck2_common::argv::parse_config_flags;
+        use buck2_common::legacy_configs::telemetry::redact_config_argument;
 
         let mut args: Vec<RepresentativeConfigFlag> = Vec::new();
         let mut last_flagfile = None;
@@ -575,7 +576,8 @@ impl<'a> BuckArgMatches<'a> {
                 }
                 None => {
                     let source = match flag_value {
-                        ConfigFlagValue::ConfigFlag(v) => {
+                        ConfigFlagValue::ConfigFlag(mut v) => {
+                            redact_config_argument(&mut v);
                             RepresentativeConfigFlagSource::ConfigFlag(v)
                         }
                         ConfigFlagValue::ConfigFile(v) => {
@@ -619,6 +621,42 @@ mod tests {
     }
 
     #[test]
+    fn representative_config_sources_redact_innocuous_alias_values() {
+        let mut argv = ExpandedArgvBuilder::new();
+        argv.push("--config=cell//ordinary.choice=synthetic-inline-credential".to_owned());
+        argv.argfile_scope(ArgFileKind::Stdin, |argv| {
+            argv.push("-c".to_owned());
+            argv.push("ordinary.other=synthetic-argfile-credential".to_owned());
+        });
+        argv.push("-cbuild.threads=8".to_owned());
+        argv.push("-c".to_owned());
+        argv.push("synthetic-padded-credential==".to_owned());
+        let argv = argv.build();
+        let clap = clap::ArgMatches::default();
+        let matches = BuckArgMatches::from_clap(&clap, &argv);
+        assert_eq!(
+            matches.get_representative_config_flags_by_source(),
+            vec![
+                source(RepresentativeConfigFlagSource::ConfigFlag(
+                    "cell//ordinary.choice=<redacted>".to_owned(),
+                )),
+                source(RepresentativeConfigFlagSource::ConfigFlag(
+                    "ordinary.other=<redacted>".to_owned(),
+                )),
+                source(RepresentativeConfigFlagSource::ConfigFlag(
+                    "build.threads=<redacted>".to_owned(),
+                )),
+                source(RepresentativeConfigFlagSource::ConfigFlag(
+                    "<redacted>".to_owned(),
+                )),
+            ],
+        );
+        assert!(argv.args().any(|arg| arg.contains("synthetic-inline-credential")));
+        assert!(argv.args().any(|arg| arg.contains("synthetic-argfile-credential")));
+        assert!(argv.args().any(|arg| arg == "synthetic-padded-credential=="));
+    }
+
+    #[test]
     fn test_by_source_inline_flags() -> buck2_error::Result<()> {
         let mut argv = ExpandedArgvBuilder::new();
         argv.push("-c".to_owned());
@@ -640,7 +678,7 @@ mod tests {
             flags,
             vec![
                 source(RepresentativeConfigFlagSource::ConfigFlag(
-                    "section.key=val".to_owned()
+                    "section.key=<redacted>".to_owned()
                 )),
                 source(RepresentativeConfigFlagSource::Modifier(
                     "//mod:bar".to_owned()
@@ -698,13 +736,13 @@ mod tests {
             flags,
             vec![
                 source(RepresentativeConfigFlagSource::ConfigFlag(
-                    "inline.key=val".to_owned()
+                    "inline.key=<redacted>".to_owned()
                 )),
                 source(RepresentativeConfigFlagSource::ModeFile(
                     "@root//mode/dev".to_owned()
                 )),
                 source(RepresentativeConfigFlagSource::ConfigFlag(
-                    "external.key=val".to_owned()
+                    "external.key=<redacted>".to_owned()
                 )),
             ]
         );

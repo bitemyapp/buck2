@@ -10,6 +10,8 @@
 
 #![feature(used_with_arg)]
 
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 
 use buck2_client::commands::build::BuildCommand;
@@ -55,6 +57,8 @@ use buck2_cmd_log_client::LogCommand;
 use buck2_cmd_rage_client::rage::RageCommand;
 use buck2_cmd_starlark_client::StarlarkCommand;
 use buck2_common::argv::Argv;
+use buck2_common::argv::ConfigArgvRedactions;
+use buck2_common::argv::ExpandedArgv;
 use buck2_common::invocation_paths::RESERVED_BUCK_OUT_PREFIX;
 use buck2_common::invocation_paths_result::InvocationPathsResult;
 use buck2_common::invocation_roots::get_invocation_paths_result;
@@ -73,6 +77,7 @@ use buck2_fs::paths::file_name::FileNameBuf;
 use buck2_util::threads::thread_spawn_scoped;
 use clap::CommandFactory;
 use clap::FromArgMatches;
+use clap::builder::TypedValueParser;
 use dupe::Dupe;
 
 use crate::check_user_allowed::check_user_allowed;
@@ -263,6 +268,65 @@ impl Opt {
     }
 }
 
+/// Capture actual CLI value consumption rather than reparsing short-option
+/// clusters or treating Clap's logical indices as physical argv positions.
+/// Capture happens before global settings can overwrite earlier value lists.
+fn parse_argv(
+    argv: Vec<String>,
+    expanded: ExpandedArgv,
+) -> Result<(Argv, clap::ArgMatches), clap::Error> {
+    fn install_parsers(
+        command: clap::Command,
+        config: &clap::builder::ValueParser,
+        settings: &clap::builder::ValueParser,
+    ) -> clap::Command {
+        let has_config = command.get_arguments().any(|arg| arg.get_id() == "config_values");
+        let command = if has_config {
+            command.mut_arg("config_values", |arg| arg.value_parser(config.clone()))
+        } else {
+            command
+        };
+        let has_settings = command.get_arguments().any(|arg| arg.get_id() == "settings");
+        let command = if has_settings {
+            command.mut_arg("settings", |arg| arg.value_parser(settings.clone()))
+        } else {
+            command
+        };
+        command.mut_subcommands(|child| install_parsers(child, config, settings))
+    }
+
+    let source = Arc::new((argv, expanded));
+    let redactions = Arc::new(Mutex::new(ConfigArgvRedactions::default()));
+    let command = {
+        let source = Arc::clone(&source);
+        let redactions = Arc::clone(&redactions);
+        let capture = move |value: &str| {
+            redactions
+                .lock()
+                .expect("CLI redaction capture was poisoned")
+                .record(&source.0, &source.1, value);
+        };
+        let capture_setting = capture.clone();
+        let config = clap::builder::StringValueParser::new().map(move |value| {
+            capture(&value);
+            value
+        });
+        let settings = buck_error_clap_parser(move |value: &str| {
+            capture_setting(value);
+            parse_setting_flag_arg(value)
+        });
+        install_parsers(Opt::clap_command(), &config.into(), &settings.into())
+    };
+    let matches = command.try_get_matches_from(source.1.args())?;
+    let (argv, expanded) = Arc::try_unwrap(source)
+        .unwrap_or_else(|_| panic!("CLI parser retained argument source"));
+    let redactions = Arc::try_unwrap(redactions)
+        .unwrap_or_else(|_| panic!("CLI parser retained redaction capture"))
+        .into_inner()
+        .expect("CLI redaction capture was poisoned");
+    Ok((Argv::new(argv, expanded, redactions), matches))
+}
+
 pub fn exec(process: ProcessContext<'_>) -> ExitResult {
     let cwd = process.shared.working_dir.clone();
     let mut immediate_config = ImmediateConfigContext::new(&cwd);
@@ -275,14 +339,8 @@ pub fn exec(process: ProcessContext<'_>) -> ExitResult {
     )
     .buck_error_context("Error expanding argsfiles")?;
 
-    let argv = Argv {
-        argv: process.shared.args.to_vec(),
-        expanded_argv: expanded_args,
-    };
-
-    let clap = Opt::clap_command();
-    let matches = match clap.try_get_matches_from(argv.expanded_argv.args()) {
-        Ok(matches) => matches,
+    let (argv, matches) = match parse_argv(process.shared.args.to_vec(), expanded_args) {
+        Ok(parsed) => parsed,
         Err(e) => {
             // Print colorized output, ExitResult::report will not colorize.
             // `ClientIoError` so that a closed stdout exits quietly instead of as a buck2 failure,
@@ -687,6 +745,171 @@ impl CommandKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_config_argv_private(argv: &Argv, secret: &str) {
+        for sanitized in [
+            argv.clone().no_need_to_sanitize(),
+            argv.clone().redacted(Default::default()),
+        ] {
+            assert!(!sanitized.argv.join(" ").contains(secret));
+            assert!(!sanitized.expanded_argv.args().collect::<Vec<_>>().join(" ").contains(secret));
+        }
+        assert!(!buck2_common::argv::get_representative_config_flags(&argv.expanded_argv)
+            .join(" ")
+            .contains(secret));
+    }
+
+    #[test]
+    fn cli_parser_classifies_clustered_config_values_without_mutating_execution() {
+        for value in [
+            "ordinary.choice=synthetic-private-token",
+            "ordinary.choice=synthetic-private-token= // Unicode 秘密",
+            "synthetic-private-token==",
+            "ordinary.choice=",
+        ] {
+            for config_args in [
+                vec!["-Ac".to_owned(), value.to_owned()],
+                vec![format!("-Ac{value}")],
+            ] {
+                let mut args = vec!["buck2".to_owned(), "cquery".to_owned()];
+                args.extend(config_args);
+                // The duplicate also exercises idempotent capture and spans.
+                args.extend(["-c".to_owned(), value.to_owned(), "//:target".to_owned()]);
+                let (argv, matches) = parse_argv(
+                    args.clone(),
+                    ExpandedArgv::from_literals(args.clone()),
+                ).unwrap();
+                assert_eq!(argv.argv, args);
+                assert_eq!(argv.expanded_argv.args().collect::<Vec<_>>(), args);
+                assert_eq!(
+                    matches.subcommand().unwrap().1
+                        .get_many::<String>("config_values").unwrap()
+                        .map(String::as_str).collect::<Vec<_>>(),
+                    vec![value, value],
+                );
+                assert_config_argv_private(&argv, "synthetic-private-token");
+                let sanitized = argv.clone().no_need_to_sanitize();
+                assert!(sanitized.argv.iter().any(|arg| arg.contains("<redacted>")));
+                if value == "synthetic-private-token==" {
+                    assert!(sanitized.argv.iter().any(|arg| arg == "<redacted>" || arg == "-Ac<redacted>"));
+                } else {
+                    assert!(sanitized.argv.iter().any(|arg| arg.contains("ordinary.choice=<redacted>")));
+                }
+                assert_eq!(argv.argv, args);
+            }
+        }
+    }
+
+    #[test]
+    fn cli_parser_does_not_reinterpret_a_value_taking_short_option_as_config() {
+        let args: Vec<String> = [
+            "buck2", "cquery", "-acordinary.choice=public", "//:target",
+        ].into_iter().map(str::to_owned).collect();
+        let (argv, matches) = parse_argv(
+            args.clone(),
+            ExpandedArgv::from_literals(args.clone()),
+        ).unwrap();
+        assert!(matches.subcommand().unwrap().1.get_many::<String>("config_values").is_none());
+        assert_eq!(argv.no_need_to_sanitize().argv, args);
+    }
+
+    #[test]
+    fn cli_capture_redacts_overwritten_global_settings_without_changing_toml_values() {
+        let args: Vec<String> = [
+            "buck2",
+            "--setting", "ordinary.choice=\"synthetic-first-private-token = // 秘密\"",
+            "cquery",
+            "--setting=ordinary.choice=\"synthetic-second-private-token\"",
+            "//:target",
+        ].into_iter().map(str::to_owned).collect();
+        let baseline = Opt::clap_command().try_get_matches_from(&args).unwrap();
+        let (argv, matches) = parse_argv(
+            args.clone(),
+            ExpandedArgv::from_literals(args.clone()),
+        ).unwrap();
+        assert_eq!(
+            Opt::from_clap_matches(&matches).unwrap().common_opts.settings,
+            Opt::from_clap_matches(&baseline).unwrap().common_opts.settings,
+        );
+        assert_config_argv_private(&argv, "synthetic-first-private-token");
+        assert_config_argv_private(&argv, "synthetic-second-private-token");
+        assert_eq!(argv.argv, args);
+    }
+
+    #[test]
+    fn cli_argfile_flags_redact_inline_values_and_preserve_source_paths() -> buck2_error::Result<()> {
+        let project = buck2_core::fs::project::ProjectRootTemp::new()?;
+        project.write_file(".buckconfig", "[cells]\nroot = .\n");
+        let cwd = buck2_fs::working_dir::AbsWorkingDir::unchecked_new(
+            project.path().root().to_owned(),
+        );
+        for flag in ["-c", "--config", "--setting"] {
+            project.write_file("modefile", flag);
+            for reference in [vec!["@modefile"], vec!["--flagfile", "modefile"]] {
+                let mut args: Vec<String> = ["buck2", "cquery"]
+                    .into_iter().chain(reference).map(str::to_owned).collect();
+                args.extend([
+                    "ordinary.choice=synthetic-boundary-private-token".to_owned(),
+                    "//:target".to_owned(),
+                ]);
+                let mut context = ImmediateConfigContext::new(&cwd);
+                let expanded = expand_argv(None, args.clone(), &mut context, &cwd)?;
+                assert!(expanded.iter().any(|(arg, source)| {
+                    arg == flag && matches!(source, buck2_common::argv::ExpandedArgSource::Flagfile(_))
+                }));
+                let (argv, _) = parse_argv(args.clone(), expanded).unwrap();
+                assert_config_argv_private(&argv, "synthetic-boundary-private-token");
+                for sanitized in [
+                    argv.clone().no_need_to_sanitize(),
+                    argv.clone().redacted(Default::default()),
+                ] {
+                    assert!(sanitized.argv.iter().any(|arg| arg == "@modefile" || arg == "modefile"));
+                    assert!(sanitized.argv.iter().any(|arg| arg == "ordinary.choice=<redacted>"));
+                }
+                assert_eq!(argv.argv, args);
+                assert!(argv.expanded_argv.args().any(|arg| arg.contains("synthetic-boundary-private-token")));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cli_removal_keeps_original_redaction_positions() {
+        let args: Vec<String> = [
+            "buck2", "run",
+            "-c", "ordinary.choice=synthetic-native-private-token",
+            "//:target", "--", "-c", "synthetic-program-private-token",
+        ].into_iter().map(str::to_owned).collect();
+        let extra: Vec<String> = ["-c", "synthetic-program-private-token"]
+            .into_iter().map(str::to_owned).collect();
+        let (argv, _) = parse_argv(
+            args.clone(),
+            ExpandedArgv::from_literals(args.clone()),
+        ).unwrap();
+        let sanitized = argv.clone().redacted(extra.iter().collect());
+        assert!(!sanitized.argv.join(" ").contains("private-token"));
+        assert_eq!(sanitized.expanded_argv.args().collect::<Vec<_>>(), sanitized.argv);
+        assert!(sanitized.argv.iter().any(|arg| arg == "ordinary.choice=<redacted>"));
+        assert_eq!(argv.argv, args);
+    }
+
+    #[test]
+    fn cli_setting_errors_do_not_echo_malformed_keys_or_values() {
+        for value in [
+            "synthetic-private-token==",
+            "synthetic-private-token=",
+            "synthetic-private-token",
+            "ordinary.choice=1\nanother=\"synthetic-private-token\"",
+        ] {
+            let args: Vec<String> = ["buck2", "cquery", "--setting", value, "//:target"]
+                .into_iter().map(str::to_owned).collect();
+            let error = match parse_argv(args.clone(), ExpandedArgv::from_literals(args)) {
+                Err(error) => error,
+                Ok(_) => panic!("malformed setting unexpectedly parsed"),
+            };
+            assert!(!error.to_string().contains("synthetic-private-token"));
+        }
+    }
 
     fn agent_context(args: &[&str]) -> Vec<AgentContextEntry> {
         let matches = Opt::clap_command()

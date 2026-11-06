@@ -99,7 +99,7 @@ async fn configuration_matches(
     // Cell used for buckconfigs is set to cell of target that applies select to match Buck v1 behavior.
     // Eventually, we want this to be the cell of the platform instead.
     for (raw_section_and_key, config_value) in &constraints_and_configs.buckconfigs {
-        let config_section_and_key = parse_config_section_and_key(raw_section_and_key, None)?;
+        let config_section_and_key = parse_config_section_and_key(raw_section_and_key)?;
         let v = ctx
             .get_legacy_config_property(
                 target_node_cell.0,
@@ -119,7 +119,7 @@ async fn configuration_matches(
         let root_config = ctx.get_legacy_root_config_on_dice().await?;
 
         for (raw_section_and_key, config_value) in &constraints_and_configs.root_buckconfigs {
-            let config_section_and_key = parse_config_section_and_key(raw_section_and_key, None)?;
+            let config_section_and_key = parse_config_section_and_key(raw_section_and_key)?;
             let v = root_config.lookup(
                 ctx,
                 BuckconfigKeyRef {

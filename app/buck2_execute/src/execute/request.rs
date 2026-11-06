@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -373,6 +373,11 @@ pub struct CommandExecutionRequest {
     timeout: Option<Duration>,
     pub executor_preference: ExecutorPreference,
     host_sharing_requirements: Arc<HostSharingRequirements>,
+    /// Local admission order only; never serialized into the remote action.
+    priority: i32,
+    /// Allows speculative CAS blobs while local execution runs. Successful
+    /// action/depfile publication still requires final output validation.
+    pipeline_cache_upload: bool,
     // Used to disable the low pass filter for concurrent local actions. Enabled by default
     low_pass_filter: bool,
     /// Working directory, relative to the project root.
@@ -447,6 +452,8 @@ impl CommandExecutionRequest {
             timeout: None,
             executor_preference: ExecutorPreference::Default,
             host_sharing_requirements: Arc::new(HostSharingRequirements::default()),
+            priority: 0,
+            pipeline_cache_upload: false,
             low_pass_filter: true,
             working_directory: ProjectRelativePathBuf::default(),
             prefetch_lossy_stderr: false,
@@ -499,6 +506,15 @@ impl CommandExecutionRequest {
         self
     }
 
+    pub fn with_pipeline_cache_upload(mut self, allowed: bool) -> Self {
+        self.pipeline_cache_upload = allowed;
+        self
+    }
+
+    pub fn pipeline_cache_upload(&self) -> bool {
+        self.pipeline_cache_upload
+    }
+
     pub fn with_executor_preference(mut self, executor_preference: ExecutorPreference) -> Self {
         self.executor_preference = executor_preference;
         self
@@ -509,6 +525,11 @@ impl CommandExecutionRequest {
         host_sharing_requirements: Arc<HostSharingRequirements>,
     ) -> Self {
         self.host_sharing_requirements = host_sharing_requirements;
+        self
+    }
+
+    pub fn with_priority(mut self, priority: i32) -> Self {
+        self.priority = priority;
         self
     }
 
@@ -609,6 +630,10 @@ impl CommandExecutionRequest {
 
     pub fn host_sharing_requirements(&self) -> &HostSharingRequirements {
         &self.host_sharing_requirements
+    }
+
+    pub fn priority(&self) -> i32 {
+        self.priority
     }
 
     pub fn low_pass_filter(&self) -> bool {
