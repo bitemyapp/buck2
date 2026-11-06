@@ -2621,6 +2621,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "pin-project",
  "prost",
+ "rayon",
  "regex",
  "remote_execution",
  "rusqlite",

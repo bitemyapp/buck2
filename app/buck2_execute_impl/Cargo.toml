@@ -59,6 +59,7 @@ assert_matches.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 buck2_forkserver.workspace = true
 buck2_forkserver_proto.workspace = true
+rayon.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 buck2_forkserver.workspace = true

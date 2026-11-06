@@ -54,12 +54,28 @@ mod linux {
     use buck2_error::BuckErrorContext;
     use buck2_execute::digest_config::DigestConfig;
     use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
+    use rayon::iter::IntoParallelRefIterator;
+    use rayon::iter::ParallelIterator;
     use rusqlite::Connection;
     use rusqlite::OptionalExtension;
     use rusqlite::params;
     use tempfile::NamedTempFile;
 
     const INGEST_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+
+    // Materialization already runs on Tokio's blocking pool while holding store
+    // locks. Never submit nested blocking work there: a saturated pool could
+    // deadlock. These dedicated workers only synchronize borrowed file handles.
+    static FILE_SYNCS: LazyLock<Result<rayon::ThreadPool, String>> = LazyLock::new(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(super::INGEST_BATCH_FILES)
+            .spawn_handler(|thread| {
+                buck2_util::threads::thread_spawn("buck2-cow-io", move || thread.run())
+                    .map(|_| ())
+            })
+            .build()
+            .map_err(|error| error.to_string())
+    });
 
     // Linux x86-64 UAPI.
     const FICLONE: std::ffi::c_ulong = 0x40049409;
@@ -697,16 +713,28 @@ mod linux {
                 }
             }
 
-            // Stage all verified snapshots first, then retain EVERY file sync.
-            // This allows kernel writeback coalescing without assuming it or
-            // introducing nested executors while holding the store locks.
-            for object in &objects {
-                if let Some(staged) = &object.staged {
-                    staged.as_file().sync_all()?;
+            // Every verified snapshot must be durable before accounting or
+            // publication. The dedicated pool joins all work, including on an
+            // error, before any stage can be removed or renamed.
+            {
+                let mut files = objects
+                    .iter()
+                    .filter_map(|object| object.staged.as_ref())
+                    .chain(publications.iter().map(|publication| &publication.file));
+                if let Some(first) = files.next() {
+                    if files.next().is_none() {
+                        // Singleton downloads and files do not start a pool.
+                        first.as_file().sync_all()?;
+                    } else {
+                        FILE_SYNCS.as_ref().map_err(error)?.install(|| {
+                            objects
+                                .par_iter()
+                                .filter_map(|object| object.staged.as_ref())
+                                .chain(publications.par_iter().map(|publication| &publication.file))
+                                .try_for_each(|file| file.as_file().sync_all())
+                        })?;
+                    }
                 }
-            }
-            for publication in &publications {
-                publication.file.as_file().sync_all()?;
             }
             if removed_names {
                 File::open(&self.root)?.sync_all()?;
@@ -1283,6 +1311,53 @@ mod linux {
                         assert_eq!(fs::read(path)?, vec![(index % 16) as u8; 4096]);
                     }
                     Ok(())
+                },
+            )
+        }
+
+        #[test]
+        fn reflink_store_syncs_complete_with_one_blocking_worker() -> buck2_error::Result<()> {
+            super::super::download_tests::check_descriptor_limit(
+                true,
+                "materializers::local_content_store::linux::tests::reflink_store_syncs_complete_with_one_blocking_worker",
+                || {
+                    // This callback runs only in the isolated, single-test child.
+                    // Bound a wrong-pool deadlock without hanging the parent suite.
+                    std::thread::spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_secs(30));
+                        eprintln!("Content-store synchronization deadlocked");
+                        std::process::exit(1);
+                    });
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .max_blocking_threads(1)
+                        .build()?;
+                    runtime.block_on(async {
+                        tokio::task::spawn_blocking(|| -> buck2_error::Result<()> {
+                            let temp = tempfile::tempdir()?;
+                            let config = DigestConfig::leak_new(vec![DigestAlgorithm::Sha256], None)?;
+                            let store = Mutex::new(Store::open(temp.path().join("store"), 16384, 4)?);
+                            let store = store.lock().expect("uncontended store");
+                            let mut files = Vec::new();
+                            for index in 0..2u8 {
+                                let path = temp.path().join(format!("file-{index}"));
+                                let bytes = [index + 1; 4096];
+                                fs::write(&path, bytes)?;
+                                files.push((
+                                    path,
+                                    FileDigest::from_content(&bytes, config.cas_digest_config()),
+                                    false,
+                                ));
+                            }
+                            // Exercise canonical stages, then existing-object
+                            // publication snapshots, on the sole blocking worker.
+                            ingest_groups(&store, &files, config)?;
+                            ingest_groups(&store, &files, config)?;
+                            for (index, (path, _, _)) in files.iter().enumerate() {
+                                assert_eq!(fs::read(path)?, vec![index as u8 + 1; 4096]);
+                            }
+                            Ok(())
+                        }).await.map_err(error)?
+                    })
                 },
             )
         }
