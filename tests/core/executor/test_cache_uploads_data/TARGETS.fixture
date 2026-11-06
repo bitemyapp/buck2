@@ -37,3 +37,24 @@ write(
     default_target_platform = "//platforms:target",
     exec_compatible_with = ["//platforms:cache_uploads"],
 )
+
+# Both commands exit successfully, but neither may publish a successful cache root.
+write(
+    name = "write_missing_output",
+    format = "{}.unexpected",
+    text = read_config("write", "text") or fail("text missing"),
+    allow_cache_upload = True,
+    local_only = True,
+    default_target_platform = "//platforms:target",
+    exec_compatible_with = ["//platforms:cache_uploads"],
+)
+
+write(
+    name = "write_wrong_output_type",
+    dir = True,
+    text = read_config("write", "text") or fail("text missing"),
+    allow_cache_upload = True,
+    local_only = True,
+    default_target_platform = "//platforms:target",
+    exec_compatible_with = ["//platforms:cache_uploads"],
+)

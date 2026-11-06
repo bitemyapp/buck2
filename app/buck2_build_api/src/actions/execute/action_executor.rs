@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::fmt::Debug;
 use std::ops::ControlFlow;
@@ -80,7 +80,6 @@ use dice::DiceComputations;
 use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
 use either::Either;
-use itertools::Itertools;
 use mini_vec::MiniBoxSlice;
 use remote_execution::TActionResult2;
 use strong_hash::StrongHash;
@@ -168,10 +167,6 @@ impl ActionOutputsMap {
         }
     }
 
-    fn contains_key(&self, artifact: &BuildArtifactPath) -> bool {
-        self.get(artifact).is_some()
-    }
-
     fn iter(&self) -> impl Iterator<Item = (&BuildArtifactPath, &ArtifactValue)> {
         match self {
             ActionOutputsMap::Small(entries) => {
@@ -179,10 +174,6 @@ impl ActionOutputsMap {
             }
             ActionOutputsMap::Large(map) => Either::Right(map.iter()),
         }
-    }
-
-    fn keys(&self) -> impl Iterator<Item = &BuildArtifactPath> {
-        self.iter().map(|(path, _)| path)
     }
 
     fn values(&self) -> impl Iterator<Item = &ArtifactValue> {
@@ -695,7 +686,7 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_, '_> {
             ..
         } = result;
 
-        // TODO(T156483516): We should also validate that the outputs match the expected outputs
+        // Command-only outputs (such as test paths) are not action artifacts.
         let action_outputs = ActionOutputs::new(
             outputs
                 .into_iter()
@@ -741,8 +732,7 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_, '_> {
                 error: None,
             }),
         };
-        self.command_reports.extend(rejected_execution);
-        self.command_reports.push(report);
+        self.record_command_execution_reports(rejected_execution, report);
         res
     }
 
@@ -768,6 +758,15 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_, '_> {
             .await
     }
 
+    fn record_command_execution_reports(
+        &mut self,
+        rejected_execution: Option<CommandExecutionReport>,
+        report: CommandExecutionReport,
+    ) {
+        self.command_reports.extend(rejected_execution);
+        self.command_reports.push(report);
+    }
+
     async fn cache_upload(
         &mut self,
         action_digest_and_blobs: &ActionDigestAndBlobs,
@@ -775,7 +774,17 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_, '_> {
         re_result: Option<&mut TActionResult2>,
         dep_file_bundle: Option<&mut dyn IntoRemoteDepFile>,
         allow_cache_upload: bool,
-    ) -> buck2_error::Result<CacheUploadResults> {
+    ) -> Result<CacheUploadResults, ExecuteError> {
+        if execution_result.was_success() {
+            validate_action_outputs(
+                self.fs(),
+                &self.action.outputs(),
+                execution_result
+                    .outputs
+                    .iter()
+                    .filter_map(|(output, value)| Some((output.build_artifact_path()?, value))),
+            )?;
+        }
         let action = self.target();
         Ok(self
             .executor
@@ -834,88 +843,12 @@ impl<'d> BuckActionExecutor<'d> {
             };
 
             let (result, metadata) = action.execute(&mut ctx, waiting_data).await?;
-
-            // Check that all the outputs are the right output_type
-            for x in outputs.iter() {
-                let declared = x.output_type();
-                // FIXME: One day we should treat FileOrDirectory as a File, and soft_error if it is a directory
-                if declared != OutputType::FileOrDirectory {
-                    if let Some(t) = result.0.outputs.get(x.get_path()) {
-                        let real = if t.is_dir() {
-                            OutputType::Directory
-                        } else {
-                            OutputType::File
-                        };
-                        if real != declared {
-                            return Err(ExecuteError::WrongOutputType {
-                                path: self.command_executor.fs().resolve_build(
-                                    x.get_path(),
-                                    Some(&t.content_based_path_hash()),
-                                )?,
-                                declared,
-                                real,
-                            });
-                        }
-                    }
-                }
-            }
-
-            fn check_all_requested_outputs_returned_without_extra<'a>(
-                outputs: &[BuildArtifact],
-                result_outputs: impl IntoIterator<Item = &'a BuildArtifactPath>,
-            ) -> bool {
-                // Ignore ordering as outputs in original action might be ordered differently from
-                // output paths in action result (they are sorted there).
-                let result_output_paths: BuckMutSet<&BuildArtifactPath> =
-                    result_outputs.into_iter().collect();
-                let mut outputs_count = 0;
-                for output in outputs.iter() {
-                    outputs_count += 1;
-                    let output_path = output.get_path();
-                    if !result_output_paths.contains(output_path) {
-                        return false;
-                    }
-                }
-                outputs_count == result_output_paths.len()
-            }
-
-            // TODO (T122966509): Check projections here as well
-            if !check_all_requested_outputs_returned_without_extra(
+            validate_action_outputs(
+                self.command_executor.fs(),
                 &outputs,
-                result.0.outputs.keys(),
-            ) {
-                let declared = outputs
-                    .iter()
-                    .filter(|x| !result.0.outputs.contains_key(x.get_path()))
-                    .map(|x| {
-                        self.command_executor.fs().resolve_build(
-                            x.get_path(),
-                            Some(&ContentBasedPathHash::for_output_artifact()),
-                        )
-                    })
-                    .collect::<buck2_error::Result<_>>()?;
-                let real = result
-                    .0
-                    .outputs
-                    .keys()
-                    .filter(|x| {
-                        // This is error message, linear search is fine.
-                        !outputs.iter().map(|b| b.get_path()).contains(x)
-                    })
-                    .map(|x| {
-                        self.command_executor
-                            .fs()
-                            .resolve_build(x, Some(&ContentBasedPathHash::for_output_artifact()))
-                    })
-                    .collect::<buck2_error::Result<Vec<_>>>()?;
-                if real.is_empty() {
-                    Err(ExecuteError::MissingOutputs { declared })
-                } else {
-                    Err(ExecuteError::MismatchedOutputs { declared, real })
-                }
-            } else {
-                Ok((result, metadata))
-            }
+                result.0.outputs.iter(),
+            )?;
+            Ok((result, metadata))
         }
         .await;
 
@@ -924,6 +857,71 @@ impl<'d> BuckActionExecutor<'d> {
 
     pub fn invalidation_tracking_enabled(&self) -> bool {
         self.invalidation_tracking_enabled
+    }
+}
+
+/// Validate authoritative outputs before publishing cache roots, and again at the
+/// generic action boundary for action kinds which do not upload command results.
+fn validate_action_outputs<'a>(
+    fs: &ArtifactFs,
+    outputs: &[BuildArtifact],
+    result_outputs: impl IntoIterator<Item = (&'a BuildArtifactPath, &'a ArtifactValue)>,
+) -> Result<(), ExecuteError> {
+    // Borrow values rather than cloning artifacts or computing ActionOutputs'
+    // fingerprint. Like the old output-name set, this keeps large actions linear.
+    let result_outputs: BuckIndexMap<_, _> = result_outputs.into_iter().collect();
+    for output in outputs {
+        let declared = output.output_type();
+        // FileOrDirectory deliberately accepts both types.
+        if declared != OutputType::FileOrDirectory {
+            if let Some(value) = result_outputs.get(output.get_path()) {
+                let real = if value.is_dir() {
+                    OutputType::Directory
+                } else {
+                    OutputType::File
+                };
+                if real != declared {
+                    return Err(ExecuteError::WrongOutputType {
+                        path: fs.resolve_build(
+                            output.get_path(),
+                            Some(&value.content_based_path_hash()),
+                        )?,
+                        declared,
+                        real,
+                    });
+                }
+            }
+        }
+    }
+
+    // Ignore ordering: executors may return output paths in a different order.
+    // TODO (T122966509): Check projections here as well.
+    if outputs.len() == result_outputs.len()
+        && outputs
+            .iter()
+            .all(|output| result_outputs.contains_key(output.get_path()))
+    {
+        return Ok(());
+    }
+    let declared = outputs
+        .iter()
+        .filter(|output| !result_outputs.contains_key(output.get_path()))
+        .map(|output| {
+            fs.resolve_build(
+                output.get_path(),
+                Some(&ContentBasedPathHash::for_output_artifact()),
+            )
+        })
+        .collect::<buck2_error::Result<_>>()?;
+    let real = result_outputs
+        .keys()
+        .filter(|path| !outputs.iter().any(|output| output.get_path() == **path))
+        .map(|path| fs.resolve_build(path, Some(&ContentBasedPathHash::for_output_artifact())))
+        .collect::<buck2_error::Result<Vec<_>>>()?;
+    if real.is_empty() {
+        Err(ExecuteError::MissingOutputs { declared })
+    } else {
+        Err(ExecuteError::MismatchedOutputs { declared, real })
     }
 }
 

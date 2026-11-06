@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::borrow::Cow;
 use std::fmt::Display;
@@ -1416,6 +1416,11 @@ impl RunAction {
             .with_priority(self.inner.priority)
             .with_low_pass_filter(self.inner.low_pass_filter)
             .with_outputs_cleanup(!self.inner.no_outputs_cleanup)
+            .with_pipeline_cache_upload(
+                self.inner.allow_cache_upload
+                    .unwrap_or_else(|| ctx.run_action_knobs().default_allow_cache_upload)
+                    || force_cache_upload()?,
+            )
             .with_local_environment_inheritance(EnvironmentInheritance::local_command_exclusions())
             .with_force_full_hybrid_if_capable(self.inner.force_full_hybrid_if_capable)
             .with_unique_input_inodes(self.inner.unique_input_inodes)
@@ -1799,7 +1804,7 @@ impl Action for RunAction {
             // TODO(jtbraun): D121882458 moves this upload off the action's critical path. Worth
             // adopting if missing entries, e.g. after a cache bust, make these uploads visible in
             // build wall time; its in-flight limit has to rise first or it drops most seeding uploads.
-            let upload_result = ctx
+            let upload_result = match ctx
                 .cache_upload(
                     &action_and_blobs,
                     &result,
@@ -1812,7 +1817,17 @@ impl Action for RunAction {
                     },
                     allow_cache_upload,
                 )
-                .await?;
+                .await
+            {
+                Ok(upload_result) => upload_result,
+                Err(error) => {
+                    ctx.record_command_execution_reports(
+                        result.rejected_execution,
+                        result.report,
+                    );
+                    return Err(error);
+                }
+            };
 
             result.cache_upload_result = upload_result.cache_upload_outcome.to_proto();
             result.dep_file_cache_upload_result = if supports_remote_dep_files {

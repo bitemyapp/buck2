@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::collections::HashMap;
 use std::env::VarError;
@@ -30,7 +30,9 @@ use async_compression::tokio::bufread::ZstdEncoder;
 use buck2_re_configuration::Buck2OssReConfiguration;
 use buck2_re_configuration::HttpHeader;
 use dupe::Dupe;
+use futures::SinkExt;
 use futures::Stream;
+use futures::channel::mpsc::Receiver;
 use futures::future::BoxFuture;
 use futures::future::Future;
 use futures::stream::BoxStream;
@@ -78,6 +80,7 @@ use re_grpc_proto::google::rpc::Status;
 use regex::Regex;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncBufRead;
+use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -1069,7 +1072,7 @@ impl REClient {
                         Ok(resp.into_inner())
                     }
                 },
-                |segments| {
+                |segments: Receiver<WriteRequest>| {
                     let headers = headers.clone();
                     async move {
                         let resp = self
@@ -1078,7 +1081,7 @@ impl REClient {
                             .write(tonic::Request::from_parts(
                                 headers,
                                 Default::default(),
-                                futures::stream::iter(segments),
+                                segments,
                             ))
                             .await?;
                         Ok(resp.into_inner())
@@ -1750,6 +1753,92 @@ where
     })
 }
 
+/// Stream one attempt with bounded read-ahead. The producer is joined here, never spawned:
+/// cancelling the request drops its reader, and even an early successful server response
+/// must wait for source EOF (or a read error) before this attempt can succeed.
+async fn upload_bytestream<Byt>(
+    resource_name: String,
+    mut reader: Box<dyn AsyncBufRead + Unpin + Send>,
+    compressor: Option<Compressor>,
+    max_chunk_size: usize,
+    write: impl FnOnce(Receiver<WriteRequest>) -> Byt,
+) -> anyhow::Result<()>
+where
+    Byt: Future<Output = anyhow::Result<WriteResponse>> + Send,
+{
+    // Check before compression, which can emit a header even for empty input.
+    if reader.fill_buf().await?.is_empty() {
+        return Ok(());
+    }
+    let mut reader: Pin<Box<dyn AsyncRead + Unpin + Send>> = match compressor {
+        None => Pin::new(Box::new(reader)),
+        Some(Compressor::Zstd) => Pin::new(Box::new(ZstdEncoder::new(reader))),
+        Some(Compressor::Deflate) => Pin::new(Box::new(DeflateEncoder::new(reader))),
+        Some(Compressor::Brotli) => Pin::new(Box::new(BrotliEncoder::new(reader))),
+    };
+    // A zero batch limit disables batching, not ByteStream reads. Cap chunks
+    // independently of the server's batch limit to bound memory per active upload.
+    let chunk_size = if max_chunk_size == 0 {
+        64 * 1024
+    } else {
+        max_chunk_size.min(64 * 1024)
+    };
+    let (mut sender, receiver) = futures::channel::mpsc::channel(1);
+    let mut response_sender = sender.clone();
+    let produce = async {
+        let mut current_offset = 0;
+        let mut data = vec![0; chunk_size];
+        let n = reader.read(&mut data).await?;
+        data.truncate(n);
+        while !data.is_empty() {
+            // One chunk of look-ahead preserves finish_write on the last data
+            // frame, including when the source ends on an exact chunk boundary.
+            let mut next = vec![0; chunk_size];
+            let n = reader.read(&mut next).await?;
+            next.truncate(n);
+            let size = data.len() as i64;
+            if sender
+                .send(WriteRequest {
+                    resource_name: resource_name.clone(),
+                    write_offset: current_offset,
+                    finish_write: next.is_empty(),
+                    data,
+                })
+                .await
+                .is_err()
+            {
+                // A completed RPC no longer needs frames, but source failures
+                // must still fail the attempt. Drain without allocating frames.
+                current_offset += size + next.len() as i64;
+                if !next.is_empty() {
+                    current_offset +=
+                        tokio::io::copy(&mut reader, &mut tokio::io::sink()).await? as i64;
+                }
+                return anyhow::Ok(current_offset);
+            }
+            current_offset += size;
+            data = next;
+        }
+        // The response future also owns a sender so explicitly signal EOF.
+        sender.close_channel();
+        anyhow::Ok(current_offset)
+    };
+    let response = async {
+        let result = write(receiver).await;
+        // An early response may leave the RPC holding its stream. Closing the
+        // channel unblocks the producer; it still drains/checks the source.
+        response_sender.close_channel();
+        result
+    };
+    let (current_offset, response) = futures::try_join!(produce, response)?;
+    if response.committed_size != current_offset && response.committed_size != -1 {
+        return Err(anyhow::anyhow!(
+            "Failed to upload `{resource_name}`: invalid committed_size from WriteResponse"
+        ));
+    }
+    Ok(())
+}
+
 async fn upload_impl<Byt, Cas>(
     instance_name: &InstanceName,
     request: UploadRequest,
@@ -1757,7 +1846,7 @@ async fn upload_impl<Byt, Cas>(
     max_total_batch_size: usize,
     max_concurrent_uploads: Option<usize>,
     cas_f: impl Fn(BatchUpdateBlobsRequest) -> Cas + Sync + Send + Copy,
-    bystream_fut: impl Fn(Vec<WriteRequest>) -> Byt + Sync + Send + Copy,
+    bystream_fut: impl Fn(Receiver<WriteRequest>) -> Byt + Sync + Send + Copy,
 ) -> anyhow::Result<UploadResponse>
 where
     Cas: Future<Output = anyhow::Result<BatchUpdateBlobsResponse>> + Send,
@@ -1796,48 +1885,14 @@ where
     // https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto#L205
     let mut batched_blob_updates = BatchUploadReqAggregator::new(max_total_batch_size);
 
-    // Adapt the given bystream_fut to take in an AsyncBufRead
-    let bystream_fut = |resource_name: String, reader: Box<dyn AsyncBufRead + Unpin + Send>| async move {
-        let mut reader: Pin<Box<dyn AsyncRead + Unpin + Send>> = match bystream_compressor {
-            None => Pin::new(Box::new(reader)),
-            Some(Compressor::Zstd) => Pin::new(Box::new(ZstdEncoder::new(reader))),
-            Some(Compressor::Deflate) => Pin::new(Box::new(DeflateEncoder::new(reader))),
-            Some(Compressor::Brotli) => Pin::new(Box::new(BrotliEncoder::new(reader))),
-        };
-
-        let mut current_offset = 0;
-        let mut upload_segments = Vec::new();
-        let mut buf = vec![0; max_total_batch_size];
-        loop {
-            let n_read = reader.read(&mut buf).await?;
-            if n_read == 0 {
-                break;
-            }
-            upload_segments.push(WriteRequest {
-                resource_name: resource_name.clone(),
-                write_offset: current_offset,
-                finish_write: false,
-                data: buf[0..n_read].to_vec(),
-            });
-            current_offset += n_read as i64;
-        }
-        if let Some(last_segment) = upload_segments.last_mut() {
-            last_segment.finish_write = true;
-        }
-
-        if upload_segments.is_empty() {
-            // As an optimization, we can silently skip uploading empty blobs
-            return Ok(());
-        }
-
-        let response = bystream_fut(upload_segments).await?;
-        if response.committed_size != current_offset && response.committed_size != -1 {
-            return Err(anyhow::anyhow!(
-                "Failed to upload `{resource_name}`: invalid committed_size from WriteResponse"
-            ));
-        }
-
-        Ok(())
+    let bystream_fut = |resource_name, reader| {
+        upload_bytestream(
+            resource_name,
+            reader,
+            bystream_compressor,
+            max_total_batch_size,
+            bystream_fut,
+        )
     };
 
     // Create futures for any blobs that need uploading.
@@ -2102,12 +2157,351 @@ fn substitute_env_vars_impl(
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::Ordering;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU16;
+    use std::sync::atomic::AtomicUsize;
 
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_read_blobs_response;
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_response;
 
     use super::*;
+
+    struct UploadTestReader {
+        remaining: usize,
+        read_bytes: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+        fail_at_end: bool,
+    }
+
+    impl AsyncRead for UploadTestReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if self.remaining == 0 && self.fail_at_end {
+                return std::task::Poll::Ready(Err(io::Error::other("source read failed")));
+            }
+            let n = self.remaining.min(buf.remaining());
+            buf.initialize_unfilled_to(n).fill(b'x');
+            buf.advance(n);
+            self.remaining -= n;
+            self.read_bytes.fetch_add(n, Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Drop for UploadTestReader {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_early_success_drains_source() -> anyhow::Result<()> {
+        for committed_size in [-1, 128] {
+            let read_bytes = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let reader = UploadTestReader {
+                remaining: 128,
+                read_bytes: read_bytes.clone(),
+                dropped: dropped.clone(),
+                fail_at_end: false,
+            };
+            upload_bytestream(
+                "uploads/test".to_owned(),
+                Box::new(BufReader::with_capacity(4, reader)),
+                None,
+                4,
+                |_requests| async {
+                    assert!(read_bytes.load(Ordering::SeqCst) < 128);
+                    Ok(WriteResponse { committed_size })
+                },
+            )
+            .await?;
+            assert_eq!(read_bytes.load(Ordering::SeqCst), 128);
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_retry_reopens_file() -> anyhow::Result<()> {
+        let work = tempfile::tempdir()?;
+        let path = work.path().join("blob");
+        let data: Vec<u8> = (0..128).collect();
+        tokio::fs::write(&path, &data).await?;
+        let attempts = AtomicUsize::new(0);
+        let expected = &data;
+        upload_impl(
+            &InstanceName(None),
+            UploadRequest {
+                files_with_digest: Some(vec![NamedDigest {
+                    name: path.to_str().context("tempdir is not utf8")?.to_owned(),
+                    digest: TDigest {
+                        hash: "test".to_owned(),
+                        size_in_bytes: data.len() as i64,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            None,
+            4,
+            Some(1),
+            |_request| async { panic!("not a batch upload") },
+            |mut requests| {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let first = requests.next().await.unwrap();
+                    assert_eq!(first.write_offset, 0);
+                    assert_eq!(first.data, expected[..4]);
+                    if attempt == 0 {
+                        return Err(tonic::Status::unavailable("retry this attempt").into());
+                    }
+                    assert_eq!(attempt, 1);
+                    let mut received = first.data;
+                    let mut finished = false;
+                    while let Some(request) = requests.next().await {
+                        assert!(!finished);
+                        assert_eq!(request.write_offset, received.len() as i64);
+                        finished = request.finish_write;
+                        received.extend(request.data);
+                    }
+                    assert!(finished);
+                    assert_eq!(&received, expected);
+                    Ok(WriteResponse {
+                        committed_size: received.len() as i64,
+                    })
+                }
+            },
+        )
+        .await?;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_backpressure_and_final_frame() -> anyhow::Result<()> {
+        for size in [127, 128] {
+            let read_bytes = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let reader = UploadTestReader {
+                remaining: size,
+                read_bytes: read_bytes.clone(),
+                dropped: dropped.clone(),
+                fail_at_end: false,
+            };
+            let read_bytes_ref = &read_bytes;
+            upload_bytestream(
+                "uploads/test".to_owned(),
+                Box::new(BufReader::with_capacity(4, reader)),
+                None,
+                4,
+                |mut requests| async move {
+                    let mut offset = 0;
+                    while let Some(request) = requests.next().await {
+                        if offset == 0 {
+                            // The bounded producer must stop reading while the
+                            // consumer has not polled, not just split a full buffer.
+                            assert!(read_bytes_ref.load(Ordering::SeqCst) <= 32);
+                        }
+                        assert_eq!(request.resource_name, "uploads/test");
+                        assert_eq!(request.write_offset, offset as i64);
+                        assert!(!request.data.is_empty());
+                        assert!(request.data.len() <= 4);
+                        assert!(request.data.iter().all(|b| *b == b'x'));
+                        offset += request.data.len();
+                        assert_eq!(request.finish_write, offset == size);
+                    }
+                    assert_eq!(offset, size);
+                    Ok(WriteResponse {
+                        committed_size: offset as i64,
+                    })
+                },
+            )
+            .await?;
+            assert_eq!(read_bytes.load(Ordering::SeqCst), size);
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_read_error_after_early_success() {
+        for committed_size in [-1, 128] {
+            let read_bytes = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let reader = UploadTestReader {
+                remaining: 128,
+                read_bytes: read_bytes.clone(),
+                dropped: dropped.clone(),
+                fail_at_end: true,
+            };
+            let error = upload_bytestream(
+                "uploads/test".to_owned(),
+                Box::new(BufReader::with_capacity(4, reader)),
+                None,
+                4,
+                |_requests| async {
+                    assert!(read_bytes.load(Ordering::SeqCst) < 128);
+                    Ok(WriteResponse { committed_size })
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.to_string(), "source read failed");
+            assert_eq!(read_bytes.load(Ordering::SeqCst), 128);
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_read_error_cancels_rpc() {
+        let reader = UploadTestReader {
+            remaining: 128,
+            read_bytes: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::new(AtomicBool::new(false)),
+            fail_at_end: true,
+        };
+        let error = upload_bytestream(
+            "uploads/test".to_owned(),
+            Box::new(BufReader::with_capacity(4, reader)),
+            None,
+            4,
+            |mut requests| async move {
+                while let Some(request) = requests.next().await {
+                    assert!(!request.finish_write);
+                }
+                futures::future::pending::<anyhow::Result<WriteResponse>>().await
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "source read failed");
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_cancellation_drops_source() {
+        let read_bytes = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let reader = UploadTestReader {
+            remaining: 128,
+            read_bytes: read_bytes.clone(),
+            dropped: dropped.clone(),
+            fail_at_end: false,
+        };
+        let mut upload = Box::pin(upload_bytestream(
+            "uploads/test".to_owned(),
+            Box::new(BufReader::with_capacity(4, reader)),
+            None,
+            4,
+            |requests| async move {
+                // Retain the receiver without consuming it, as a stalled RPC does.
+                let result = futures::future::pending::<anyhow::Result<WriteResponse>>().await;
+                drop(requests);
+                result
+            },
+        ));
+        assert!(futures::poll!(upload.as_mut()).is_pending());
+        assert!(read_bytes.load(Ordering::SeqCst) <= 32);
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(upload);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_rpc_error_drops_source() {
+        let read_bytes = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let reader = UploadTestReader {
+            remaining: 128,
+            read_bytes: read_bytes.clone(),
+            dropped: dropped.clone(),
+            fail_at_end: false,
+        };
+        let error = upload_bytestream(
+            "uploads/test".to_owned(),
+            Box::new(BufReader::with_capacity(4, reader)),
+            None,
+            4,
+            |_requests| async { Err(anyhow::anyhow!("RPC failed")) },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "RPC failed");
+        assert!(read_bytes.load(Ordering::SeqCst) < 128);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_compressors() -> anyhow::Result<()> {
+        let data: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+        for compressor in [
+            None,
+            Some(Compressor::Zstd),
+            Some(Compressor::Deflate),
+            Some(Compressor::Brotli),
+        ] {
+            let expected = &data;
+            upload_bytestream(
+                "uploads/test".to_owned(),
+                Box::new(Cursor::new(data.clone())),
+                compressor,
+                13,
+                |mut requests| async move {
+                    let mut encoded = Vec::new();
+                    let mut finished = false;
+                    while let Some(request) = requests.next().await {
+                        assert!(!finished);
+                        assert_eq!(request.write_offset, encoded.len() as i64);
+                        assert!(!request.data.is_empty());
+                        assert!(request.data.len() <= 13);
+                        finished = request.finish_write;
+                        encoded.extend(request.data);
+                    }
+                    assert!(finished);
+                    let committed_size = encoded.len() as i64;
+                    let mut decoder: Box<dyn AsyncRead + Unpin + Send> = match compressor {
+                        None => Box::new(Cursor::new(encoded)),
+                        Some(Compressor::Zstd) => Box::new(ZstdDecoder::new(Cursor::new(encoded))),
+                        Some(Compressor::Deflate) => {
+                            Box::new(DeflateDecoder::new(Cursor::new(encoded)))
+                        }
+                        Some(Compressor::Brotli) => {
+                            Box::new(BrotliDecoder::new(Cursor::new(encoded)))
+                        }
+                    };
+                    let mut decoded = Vec::new();
+                    decoder.read_to_end(&mut decoded).await?;
+                    assert_eq!(&decoded, expected);
+                    Ok(WriteResponse { committed_size })
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_zero_batch_limit() -> anyhow::Result<()> {
+        upload_bytestream(
+            "uploads/test".to_owned(),
+            Box::new(Cursor::new(b"data".to_vec())),
+            None,
+            0,
+            |mut requests| async move {
+                let request = requests.next().await.unwrap();
+                assert_eq!(request.data, b"data");
+                assert_eq!(request.write_offset, 0);
+                assert!(request.finish_write);
+                assert!(requests.next().await.is_none());
+                Ok(WriteResponse { committed_size: 4 })
+            },
+        )
+        .await
+    }
 
     fn missing_input_status(violation_type: &str, subject: &str) -> Status {
         Status {
@@ -3147,6 +3541,7 @@ mod tests {
             |write_reqs| {
                 let blob_data = blob_data.clone();
                 async move {
+                    let write_reqs = write_reqs.collect::<Vec<_>>().await;
                     assert_eq!(write_reqs.len(), 2);
                     assert_eq!(write_reqs[0].write_offset, 0);
                     assert!(!write_reqs[0].finish_write);
@@ -3223,6 +3618,7 @@ mod tests {
             |write_reqs| {
                 let blob_data2 = blob_data2.clone();
                 async move {
+                    let write_reqs = write_reqs.collect::<Vec<_>>().await;
                     assert_eq!(write_reqs.len(), 2);
                     assert_eq!(write_reqs[0].write_offset, 0);
                     assert!(!write_reqs[0].finish_write);
@@ -3337,6 +3733,7 @@ mod tests {
                 panic!("Not called");
             },
             |write_reqs| async move {
+                let write_reqs = write_reqs.collect::<Vec<_>>().await;
                 assert_eq!(write_reqs.len(), 2);
                 assert!(write_reqs[1].finish_write);
                 anyhow::Ok(WriteResponse { committed_size: 6 })
@@ -3456,6 +3853,7 @@ mod tests {
                 panic!("Not called");
             },
             |write_reqs| async move {
+                let write_reqs = write_reqs.collect::<Vec<_>>().await;
                 assert!(write_reqs[0].resource_name.starts_with("instance/uploads/"));
                 assert!(write_reqs[0].resource_name.ends_with("/blobs/aa/3"));
                 anyhow::Ok(WriteResponse { committed_size: 3 })
@@ -3503,6 +3901,7 @@ mod tests {
                 panic!("Not called");
             },
             |write_reqs| async move {
+                let write_reqs = write_reqs.collect::<Vec<_>>().await;
                 assert!(write_reqs[0].resource_name.starts_with("instance/uploads/"));
                 assert!(
                     write_reqs[0]
@@ -3648,6 +4047,7 @@ async fn test_upload_compressed() -> anyhow::Result<()> {
         },
         {
             |write_reqs| async move {
+                let write_reqs = write_reqs.collect::<Vec<_>>().await;
                 let compressed_data: Vec<u8> =
                     write_reqs.iter().flat_map(|wr| wr.data.clone()).collect();
                 let mut data = vec![];

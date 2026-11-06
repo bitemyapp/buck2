@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::sync::Arc;
 
@@ -213,6 +213,7 @@ async fn ensure_uploaded(
             ProjectRelativePath::empty(),
             &dir,
             None,
+            buck2_execute::re::presence::NegativeCache::Allowed,
         )
         .await?;
 

@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::path::Path;
 use std::str::FromStr;
@@ -73,6 +73,7 @@ impl Uploader {
         input_dir: &'a ActionImmutableDirectory,
         blobs: &'a ActionBlobs,
         use_case: RemoteExecutorUseCase,
+        negative_cache: NegativeCache,
     ) -> buck2_error::Result<(
         Vec<InlinedBlobWithDigest>,
         BuckMutSet<&'a TrackedFileDigest>,
@@ -103,7 +104,7 @@ impl Uploader {
                     .iter()
                     .map(|digest| (*digest).dupe())
                     .collect(),
-                NegativeCache::Allowed,
+                negative_cache,
             )
             .await?;
 
@@ -146,9 +147,10 @@ impl Uploader {
         blobs: &ActionBlobs,
         use_case: RemoteExecutorUseCase,
         identity: Option<&ReActionIdentity<'_>>,
+        negative_cache: NegativeCache,
     ) -> buck2_error::Result<UploadStats> {
         let (mut upload_blobs, mut missing_digests) =
-            Self::find_missing(client, input_dir, blobs, use_case).await?;
+            Self::find_missing(client, input_dir, blobs, use_case, negative_cache).await?;
 
         if upload_blobs.is_empty() && missing_digests.is_empty() {
             return Ok(UploadStats::default());
@@ -402,13 +404,13 @@ impl Uploader {
 #[cfg(fbcode_build)] // Relies on fbcode future sizes
 buck2_util::size_assert::words_of_async_fn_future!(
     Uploader::upload,
-    (_, _, _, _, _, _, _, _),
+    (_, _, _, _, _, _, _, _, _),
     ~287
 );
 #[cfg(fbcode_build)] // Relies on fbcode future sizes
 buck2_util::size_assert::words_of_async_fn_future!(
     Uploader::find_missing,
-    (_, _, _, _),
+    (_, _, _, _, _),
     ~65
 );
 

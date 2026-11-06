@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -319,6 +319,7 @@ impl RemoteExecutionClient {
         input_dir: &ActionImmutableDirectory,
         use_case: RemoteExecutorUseCase,
         identity: Option<&ReActionIdentity<'_>>,
+        negative_cache: NegativeCache,
     ) -> buck2_error::Result<UploadStats> {
         // Actually upload to CAS
         let _cas = self.data.client.cas_semaphore.acquire().await;
@@ -334,6 +335,7 @@ impl RemoteExecutionClient {
                 blobs,
                 use_case,
                 identity,
+                negative_cache,
             ))
             .await
     }

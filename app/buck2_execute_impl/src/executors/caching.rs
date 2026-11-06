@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -37,11 +37,13 @@ use buck2_execute::execute::cache_uploader::UploadCache;
 use buck2_execute::execute::kind::CommandExecutionKind;
 use buck2_execute::execute::result::CommandExecutionResult;
 use buck2_execute::execute::result::CommandExecutionStatus;
+use buck2_execute::materialize::materializer::CasDownloadInfo;
 use buck2_execute::materialize::materializer::MaterializationPurpose;
 use buck2_execute::materialize::materializer::MaterializeRequest;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::client::ActionCacheWriteType;
 use buck2_execute::re::manager::ManagedRemoteExecutionClient;
+use buck2_execute::re::presence::NegativeCache;
 use dupe::Dupe;
 use futures::future;
 use futures::future::FutureExt;
@@ -100,6 +102,28 @@ impl CacheUploader {
             max_bytes,
             cache_upload_permission_checker,
         }
+    }
+
+    /// Only CAS blobs are eligible before success. A configured whole-action
+    /// size limit cannot be proven until the final tree exists, so those actions
+    /// retain the ordinary final upload path rather than weakening that policy.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn output_pipeline_client(
+        &self,
+        digest_config: DigestConfig,
+    ) -> buck2_error::Result<Option<ManagedRemoteExecutionClient>> {
+        if self.max_bytes.is_some() {
+            return Ok(None);
+        }
+        if self
+            .cache_upload_permission_checker
+            .has_permission_to_upload_to_cache(&self.re_client, &self.platform, digest_config)
+            .await?
+            .is_err()
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.re_client.dupe()))
     }
 
     /// Publish successful outputs under the lookup key. Local outputs must be
@@ -417,11 +441,19 @@ impl CacheUploader {
                     };
 
                     file_digests.push(f.digest.dupe());
-                    upload_futs.push(
-                        self.re_client
-                            .upload_files_and_directories(vec![named_digest], vec![], vec![])
-                            .boxed(),
-                    );
+                    let digest = f.digest.dupe();
+                    upload_futs.push(async move {
+                        let info = CasDownloadInfo::new_uploaded(self.re_client.use_case);
+                        let present = self.re_client.check_presence(
+                            vec![digest], NegativeCache::Bypassed, &info,
+                        ).await?;
+                        if present[0].is_none() {
+                            self.re_client
+                                .upload_files_and_directories(vec![named_digest], vec![], vec![])
+                                .await?;
+                        }
+                        buck2_error::Ok(())
+                    }.boxed());
                 }
                 DirectoryEntry::Dir(d) => {
                     let tree = directory_to_re_tree(d);
@@ -445,6 +477,7 @@ impl CacheUploader {
                                 &content_path,
                                 &d.dupe().as_immutable(),
                                 identity,
+                                NegativeCache::Bypassed,
                             )
                             .await
                             .map(|_| ())

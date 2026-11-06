@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 //! Optional, machine-local content store. Objects are never hardlinked into a
 //! worktree: every publication is a verified COW snapshot and atomic rename.
@@ -63,6 +63,9 @@ mod linux {
     use rusqlite::OptionalExtension;
     use rusqlite::params;
     use tempfile::NamedTempFile;
+
+    use crate::materializers::prepared_outputs;
+    use crate::materializers::prepared_outputs::PreparedFile;
 
     const INGEST_BATCH_BYTES: u64 = 64 * 1024 * 1024;
     const INGEST_METADATA_BYTES: u64 = 256 * 1024 * 1024;
@@ -182,8 +185,38 @@ mod linux {
     }
 
     struct Publication<'a> {
-        file: NamedTempFile,
+        file: PublicationFile,
         destination: &'a Path,
+    }
+
+    enum PublicationFile {
+        Staged(NamedTempFile),
+        // Hashed, normalized and synced while its producer was still running.
+        // Its independent upload snapshot does not move with this publication.
+        Prepared(PreparedFile),
+    }
+
+    impl PublicationFile {
+        fn needs_sync(&self) -> Option<&NamedTempFile> {
+            match self {
+                Self::Staged(file) => Some(file),
+                Self::Prepared(_) => None,
+            }
+        }
+
+        fn persist(self, destination: &Path) -> buck2_error::Result<()> {
+            match self {
+                Self::Staged(file) => {
+                    file.persist(destination).map_err(|error| error.error)?;
+                }
+                Self::Prepared(file) => {
+                    file.path
+                        .persist(destination)
+                        .map_err(|error| error.error)?;
+                }
+            }
+            Ok(())
+        }
     }
 
     struct GroupResult {
@@ -720,7 +753,7 @@ mod linux {
                 object.staged = Some(staged);
                 if let IngestSource::Recovered(file) = source {
                     publications.push(Publication {
-                        file,
+                        file: PublicationFile::Staged(file),
                         destination: requests[object.first_request].destination,
                     });
                 }
@@ -731,6 +764,23 @@ mod linux {
                     // The original produced file already shares the new COW
                     // object's extents and retains its existing executable mode.
                     continue;
+                }
+                if ingest {
+                    if let Some(file) = prepared_outputs::take(
+                        request.destination, object.digest, request.executable,
+                    )? {
+                        // Remove only the consumed private hint. The verified
+                        // final digest, not a timestamp, authorizes this view.
+                        self.db.execute(
+                            "DELETE FROM views WHERE path=?1",
+                            [file.path.to_str().ok_or_else(|| error("Non-UTF-8 prepared path"))?],
+                        )?;
+                        publications.push(Publication {
+                            file: PublicationFile::Prepared(file),
+                            destination: request.destination,
+                        });
+                        continue;
+                    }
                 }
                 let publication = {
                     let source = if let Some(staged) = &object.staged {
@@ -747,7 +797,7 @@ mod linux {
                 };
                 match publication {
                     Ok(file) => publications.push(Publication {
-                        file,
+                        file: PublicationFile::Staged(file),
                         destination: request.destination,
                     }),
                     Err(error) => {
@@ -774,7 +824,7 @@ mod linux {
                 let mut files = objects
                     .iter()
                     .filter_map(|object| object.staged.as_ref())
-                    .chain(publications.iter().map(|publication| &publication.file));
+                    .chain(publications.iter().filter_map(|publication| publication.file.needs_sync()));
                 if let Some(first) = files.next() {
                     if files.next().is_none() {
                         // Singleton downloads and files do not start a pool.
@@ -784,7 +834,7 @@ mod linux {
                             objects
                                 .par_iter()
                                 .filter_map(|object| object.staged.as_ref())
-                                .chain(publications.par_iter().map(|publication| &publication.file))
+                                .chain(publications.par_iter().filter_map(|publication| publication.file.needs_sync()))
                                 .try_for_each(|file| file.as_file().sync_all())
                         })?;
                     }
@@ -822,7 +872,7 @@ mod linux {
             for publication in publications {
                 let parent = publication.destination.parent()
                     .ok_or_else(|| error("Missing output parent"))?;
-                publication.file.persist(publication.destination).map_err(|error| error.error)?;
+                publication.file.persist(publication.destination)?;
                 parents.insert(parent);
             }
             for parent in parents {
@@ -1790,7 +1840,7 @@ pub(crate) fn artifact<D: ActionDirectory>(
     Ok(())
 }
 
-fn ingest_files(
+pub(crate) fn ingest_files(
     files: &[(AbsNormPathBuf, FileMetadata)],
     config: DigestConfig,
 ) -> buck2_error::Result<()> {

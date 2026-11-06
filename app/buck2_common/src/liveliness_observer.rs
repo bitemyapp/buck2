@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -186,6 +186,7 @@ impl LivelinessObserver for Arc<dyn LivelinessObserver> {
     }
 }
 
+#[derive(Clone, Dupe)]
 pub struct LivelinessAnd<A, B> {
     a: A,
     b: B,

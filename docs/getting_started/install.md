@@ -124,8 +124,21 @@ weak-view updates share one durable SQLite transaction. Object accounting still
 commits before canonical publication, with file and directory synchronization
 preserved.
 
+Local producers can prepare private output snapshots concurrently with execution.
+Linux close-write/move events are advisory; only final output validation and
+content hashes authorize reuse or successful action-cache publication. Four
+process-wide batches of eight files share a 512 MiB/4,096-pair budget, charging
+two 4-KiB-rounded snapshots per file with no oversized exception. Prepared
+publication views remain writable and independent; CAS uploads use a separate
+stable snapshot and bounded streaming. Cancellation joins capture work and stops
+pending uploads. Failed actions can leave unreferenced CAS blobs, never a
+successful result. Write permissions and action/executor policy still apply;
+whole-action upload-size limits retain final-only remote uploads. This does not
+pipeline remote-worker ingestion or defer final root publication beyond the
+action's completion.
+
 The capacity covers cache object logical bytes, plus filesystem block rounding,
-bounded index metadata, and one in-flight object. It does not cap live worktree
+bounded index metadata, and bounded publication staging. It does not cap live worktree
 outputs or Buck's daemon state; use the
 existing deferred-materialization and clean-stale policies for those. Separate
 worktrees can still execute identical actions concurrently; this store shares

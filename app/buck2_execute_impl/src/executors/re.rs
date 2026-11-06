@@ -6,7 +6,7 @@
  * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
  * of this source tree. You may select, at your option, one of the
  * above-listed licenses.
- */
+*/
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -123,6 +123,7 @@ impl ReExecutor {
                     ProjectRelativePath::empty(),
                     paths.input_directory(),
                     Some(identity),
+                    buck2_execute::re::presence::NegativeCache::Allowed,
                 )
                 .await;
             match res {
